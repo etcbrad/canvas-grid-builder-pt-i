@@ -1,0 +1,486 @@
+Original prompt: add the model to the grid.The head piece should fit exactly in a head grid square
+
+- Updated renderer to keep drawing the model when grid-only mode is active.
+- Added model scaling in grid-only mode based on the head grid unit so the head piece fits one head grid square.
+- Validation: `npm run build` passes after renderer changes.
+- Playwright check attempted via skill client, but blocked because `playwright` is not installed (`ERR_MODULE_NOT_FOUND: playwright`).
+- Fixed arm click drift in grid mode by matching CanvasGrid pick/drag coordinates to renderer's model projection (same scale + y-offset, plus inverse mapping for IK targets).
+- Elbow/forearm pick refinements retained with overlap tie-break in favor of elbow.
+- IK anti-flicker pass: switched IK drag smoothing to time-normalized alpha (event-dt aware) and added per-step rotation delta caps so mouse event jitter cannot spike pose updates.
+- Slowed response intentionally for stability: larger low-friction target deadzone, lower target/rotation blend alphas, and max angular step limits for low-friction chains.
+- Added per-chain IK event timestamp tracking and cleanup on drag start/end to keep smoothing deterministic.
+- Validation: `npm run test -- --run` and `npm run build` both pass after smoothing changes.
+- Playwright skill-client run attempted; blocked by missing `playwright` package in environment (`ERR_MODULE_NOT_FOUND`).
+- Tap flick fix: IK solve is now gated behind a small drag threshold (3.5px) so tap/click selection doesn't trigger a solve pass.
+- Added no-op guard in IK drag path when target movement is inside deadzone; avoids solver branch jitter for stationary taps.
+- Validation: `npm run test -- --run` and `npm run build` pass after the tap-flick fix.
+- Re-tuned anti-flicker to remove introduced pause/stutter:
+  - lowered tap arm threshold from 3.5px -> 1.2px,
+  - removed hard deadzone-return in IK drag,
+  - switched to continuous smoothing with reduced alpha inside deadzone,
+  - added tiny solve epsilon (0.02) to ignore true no-op jitter only.
+- Validation: `npm run test -- --run` and `npm run build` both pass.
+- IK audit/cleanup pass:
+  - Removed hidden rigid mode in `App.tsx` that forced `stretchEnabled=false` and `softReachEnabled=false`.
+  - Movement defaults now bias for freer IK (`stretch=true`, `softReach=true`, `naturalBend=false`).
+  - Exposed Stretch + Soft Reach toggles in CanvasGrid movement controls (removed static "Rigid IK ON" row).
+  - Added explicit IK drag profiles (default + primary chains) to centralize smoothing/solver params.
+  - Standard effector pick now prefers full-body chains (`l_arm/r_arm/l_leg/r_leg/core`) over short subchains when available.
+  - IK drag solve now runs unconstrained (`enforceJointLimits=false`) with tuned smoothing/pole weight to reduce constraint friction.
+- Validation: `npm run test -- --run` and `npm run build` both pass.
+- Playwright skill loop re-attempted after IK audit; still blocked by missing `playwright` package (`ERR_MODULE_NOT_FOUND`).
+- Rollback requested: restored IK interaction stack to pre-"remove the flick" state.
+- Reverted tap-guard gating and subsequent audit/profile overrides; restored prior time-based smoothing + low-friction chain settings.
+- Reverted App movement toggles to rigid IK baseline behavior present before that request.
+- Validation after rollback: `npm run test -- --run` and `npm run build` pass.
+- Added optional grid-only "Refine" panel on the left side (opposite FK/IK toggle).
+- FK refine mode now exposes two sliders: rotation sensitivity + rotation response.
+- IK refine mode now exposes switches for Natural Bend, Handshake, FK360 Root, Extended IK Handles, Prefer Full Chains, and Unconstrained IK.
+- Preserved base defaults and behavior: new controls are opt-in and default to current runtime values.
+- Validation: `npm run test -- --run` and `npm run build` pass.
+- Left FK refine panel now includes per-joint rotation sliders for every joint in hierarchy.
+- Added `setJointRotationFromSlider` helper to apply slider changes directly to rotations state path (`rotationsRef`, `lastValidRotationsRef`, `onRotationsChange`).
+- FK refine retains global sensitivity/response controls and now adds full joint-level controls below.
+- Validation: `npm run test -- --run` and `npm run build` pass.
+- Implemented Humanized IK v2 core in runtime:
+  - Added `ikProfile`, `ikSolver`, `ikSolveMode`, `legIntentMode`, and human counterpart toggles to movement contract.
+  - Added pure helper modules: `ikHumanAssist.ts` (counterbalance/mirror/follow-through/collar-neck) and `ikLegIntent.ts` (walk/sway/sit/jump intent assist).
+  - Updated IK drag pipeline in `components/CanvasGrid.tsx` to support solve scopes (`single_chain`, `limbs_only`, `whole_body_graph`), solver selection (`fabrik`, `ccd`, `hybrid`), leg-intent pre-assist, and human-assist post-pass before blend.
+  - Added jump trigger support (button + Space key while in IK jump intent).
+  - Expanded IK refine UI with profile/solver/scope/leg-intent controls and human-style toggles.
+- Updated `ikSolver.ts` with explicit point solvers (`solvePointsFabrik`, `solvePointsCcd`, `solvePointsHybrid`) and exposed `solver` option in `IKSolveOptions`.
+- App-level integration:
+  - Updated `App.tsx` movement defaults and effective toggles to include all new IK fields while keeping baseline defaults (`base`/`fabrik`/`single_chain`/`none`).
+- Tests:
+  - Extended `ikSolver.test.ts` for FABRIK/CCD/Hybrid finite solve checks and per-solver length-preservation checks.
+  - Added `ikHumanAssist.test.ts` and `ikLegIntent.test.ts`.
+- Validation:
+  - `npm test` passes (3 files, 12 tests).
+  - `npm run build` passes.
+- Fixed runtime break after timeline engine API upgrade in `App.tsx`:
+  - migrated `AnimationClip` construction to config-object API (`frameCount`, `loop`, `interpolatePose`, keyed keyframes with ids),
+  - replaced legacy calls (`setKeyframe`, `removeKeyframe(frame)`, `getPoseForFrame`) with current API (`upsertKeyframe`, `removeKeyframe(id)`, `sampleFrame`),
+  - switched ghost sampling to `getGhostFrames({ frame }, config)`,
+  - added frame-count guard (`clampFrameCount`) on frame input to avoid invalid zero/NaN timeline configs.
+- Validation: `npm run build` passes.
+- Playwright validation (skill client):
+  - `http://localhost:3001` run passed, screenshot captured, no `errors-*.json` emitted.
+  - `http://localhost:3000` run passed, screenshot captured, no `errors-*.json` emitted.
+- Audited IK control surface and refactored IK refinement UX for clearer user-driven toggling.
+- Added quick IK experience presets in `components/CanvasGrid.tsx`:
+  - Precision
+  - Balanced Human
+  - Expressive
+- Added active preset detection (`Custom` fallback) so users can see current state after manual edits.
+- Added quick Leg Intent chip controls (None/Walk/Sway/Sit/Jump) with inline Jump trigger.
+- Promoted counterpart reaction toggles into a dedicated section when Human profile is active.
+- Added collapsible `Advanced Controls` section to keep all detailed toggles/selects accessible without cluttering primary interaction.
+- Validation after UX refactor: `npm test` and `npm run build` both pass.
+- FK refine sliders now use wrapped 360-degree rotation for all joints:
+  - Slider range forced to `-180..180` for every FK joint slider.
+  - Slider writes normalize via `normA` (no JOINT_LIMITS clamp).
+- Validation after FK slider wrap change: `npm test` and `npm run build` pass.
+- Added FK slider auto-wrap at bounds in `components/CanvasGrid.tsx`:
+  - Added wrapped slider handler that detects edge hit (`+180`/`-180`) and wraps to the opposite bound.
+  - Seeded per-joint previous slider value on mouse-down to make boundary detection deterministic.
+  - Reset slider wrap tracking when incoming pose/rotations props refresh.
+- Validation after wrap-at-limits behavior: `npm test` and `npm run build` pass.
+- Added new on-canvas animation interface in grid mode next to Refine/Animate:
+  - New `Anim UI` toggle button in `components/CanvasGrid.tsx`.
+  - Floating animation panel with frame nav (Prev/Next), current frame readout, keyframe add/remove, FPS, frame count, and easing selector.
+  - Wired to existing app animation state/handlers from `App.tsx` (playback, keyframe ops, timeline settings).
+- Validation pending immediately after this note: run `npm run build` and `npm test`.
+- Updated head-grid rendering in `renderer.ts` for animation tracking: head grid lines now render only on the right side of each tile's red centerline (left red line remains visible as divider).
+- Kept square boundary and centerline rendering unchanged for orientation.
+- Added on-canvas left-side head-grid timeline rail in `CanvasGrid`:
+  - Head-square slots for pose capture/projection (`SNAP` saves current pose to that frame).
+  - Minimize/expand control.
+  - Tween step control (slot frame stride).
+  - Scroll arrows on both sides of each slot + page arrows at top.
+  - Drag/drop between slots swaps keyframe poses (replace behavior).
+  - Slot click jumps current frame for editing.
+  - Thumbnail projection per slot using simplified skeleton SVG inside each head square.
+- App wiring added:
+  - Passed keyframe pose map to canvas grid.
+  - Added callbacks for save-to-slot and swap-slot keyframes.
+- Updated on-canvas animation UX to 1-based frame indexing for users:
+  - Frame display now shows `1..frameCount` (no `0` shown).
+  - Timeline rail slots now start at Frame 1 and label/save/select using 1-based labels.
+  - Internal engine storage remains 0-based for compatibility; UI maps `displayFrame -> internalFrame = displayFrame - 1`.
+- Timeline square projection updated in `CanvasGrid`:
+  - Pose thumbnail now auto-fits full skeleton head-to-toe into each square via pose bounding-box normalization.
+  - Added joint dots in thumbnail for clearer projected pose readability.
+- Timeline slot controls reorganized:
+  - Frame label + scroll arrows moved above each square.
+  - SNAP/EDIT controls moved beside each square (no overlay covering the pose).
+- Fixed interpolation shortest-path wrapping bug in `adapters/poseInterpolator.ts` by correcting negative modulo handling for angular deltas.
+- Restyled on-canvas head-grid timeline to blend with canvas:
+  - Softer glass gradient panel.
+  - Lower-contrast borders/buttons.
+  - Less saturated slot backgrounds with subtle active frame accent.
+- Fixed `CanvasGrid.tsx` runtime TDZ crash: moved `computeWorld` declaration before `computeThumbPosePath` so dependency capture does not access an uninitialized const.
+- Validation: `npm run build` passes.
+- Playwright skill smoke run against `http://localhost:3000` passed; screenshot captured at `output/web-game/post-computeWorld-order-fix-2026-02-23/shot-0.png` and no `errors-*.json` emitted.
+- Fixed App TDZ crash: moved `interpolationFramesBySegment` state hook above `clipRef` initializer so initial `createAnimationClip(...)` call does not read an uninitialized const.
+- Validation: `npm run build` passes.
+- Playwright skill smoke run against `http://localhost:3000` passed; screenshot at `output/web-game/post-interpolation-tdz-fix-2026-02-23/shot-0.png` with no `errors-*.json` emitted.
+- Consolidated grid-mode animation controls into a single left timeline rail in `components/CanvasGrid.tsx`:
+  - Removed separate `Animate` button + floating `Anim UI` panel.
+  - Added integrated play/pause, prev/next frame, current frame readout, +key/-key, FPS, frame-count, and easing controls directly in the head-grid rail.
+- Expanded timeline slot editing so animation can be adjusted fully in one surface:
+  - Added per-slot `DEL` action via new `onRemovePoseAtFrame(frame)` callback.
+  - Kept drag/swap move behavior and snap/edit actions.
+  - Added per-segment tween duration controls (`Auto`, +/- stepper) for keyframe-to-keyframe interpolation in-slot.
+- Updated `App.tsx` animation wiring:
+  - Passed `segmentInterpolationFrames` + `onSetSegmentInterpolation` + `onRemovePoseAtFrame` into `CanvasGrid`.
+  - Clamped custom transition durations to segment span when constructing `AnimationClip` transitions.
+  - Added interpolation-map cleanup to drop stale segment overrides when keyframe topology changes.
+- Validation:
+  - `npm run build` passes.
+  - `npm test -- --run` passes (12 tests).
+  - Playwright skill smoke command completed and wrote `output/web-game/animation-consolidation-2026-02-24/shot-0.png`; no `errors-*.json` artifact was emitted.
+- Additional UI-level verification with direct Playwright full-page screenshots (DOM, not canvas-only):
+  - `output/web-game/ui-check-2026-02-24/full.png` confirms single consolidated timeline rail is visible (play, frame nav, key ops, fps/frame/easing controls).
+  - `output/web-game/ui-check-2026-02-24/with-segment.png` confirms segment tween control appears after creating a second keyframe.
+  - `output/web-game/ui-check-2026-02-24/with-segment-adjusted-3.png` confirms segment tween decrement updates display from `10/10` to `9/10`.
+- Animation timeline UX update per follow-up request:
+  - Renamed `Head Grid Timeline` to `Animation Timeline` in `components/CanvasGrid.tsx`.
+  - Added `Timeline On/Off` activator next to the `Refine` button in grid mode; timeline panel now conditionally renders from that toggle.
+  - Added wheel scrolling support on the animation timeline panel (`onWheel`) to move through timeline slots (Shift+wheel pages by visible slot count).
+  - Added quick/manual frame-gap control (`Frame Gap`) for timeline slot spacing:
+    - Quick presets (`1f`, `2f`, `4f`, `8f`) with active state.
+    - Manual numeric entry mode for exact frame-gap value.
+    - Gap is clamped to clip bounds when frame count changes.
+- Validation:
+  - `npm run build` passes.
+  - `npm test -- --run` passes (12 tests).
+  - Playwright UI verification screenshots:
+    - `output/web-game/timeline-scroll-toggle-2026-02-24/state-1-default.png`
+    - `output/web-game/timeline-scroll-toggle-2026-02-24/state-2-timeline-off.png`
+    - `output/web-game/timeline-scroll-toggle-2026-02-24/state-3-manual-scroll.png`
+- Rotation safety pass: animation playback now runs as read-only preview for authored rotation state.
+  - In `App.tsx`, added playback guard so frame-sync (`syncRotationsFromClip`) is skipped while playing.
+  - Added `playbackPreviewRotations`/`displayedRotations` and pass preview pose to canvas only during playback.
+  - Added guard in `handleRotationsChange` to ignore edit writes while playback is active.
+  - Result: animation no longer mutates the working `rotations` edit state while previewing timeline motion.
+- Validation: `npm run build` and `npm test -- --run` pass after this change.
+- Playback range behavior update requested by user:
+  - In `App.tsx`, animation playback no longer wraps over `frameCount`.
+  - Added keyframe-bounded playback range resolver (`getPlaybackRange`), and animation now:
+    1) plays from current pose within posed range,
+    2) auto-stops at the last posed frame,
+    3) returns to the first posed frame when the end is reached.
+- Added `currentFrameRef` to make playback stepping deterministic and allow stop/return without modulo looping.
+- Validation:
+  - `npm run build` passes.
+  - `npm test -- --run` passes.
+  - Playwright verification wrote `output/web-game/auto-end-return-2026-02-24/status.json` showing `{ "frameLabel": "F1/60", "playLabel": "Play" }` after playback from a later keyframe.
+- Timeline gap input enhancement:
+  - `Frame gap` now always includes a custom numeric text field (`Custom`) alongside the quick/manual mode toggle.
+  - Quick preset buttons remain available in quick mode; manual mode now still keeps direct numeric input visible.
+- Per-keyframe-break custom input:
+  - Each `Tween F..→F..` section now includes its own numeric text field so interpolation duration can be typed directly for that specific keyframe break.
+  - Existing `Auto`, `-`, and `+` controls remain.
+- Validation:
+  - `npm run build` passes.
+  - `npm test -- --run` passes.
+  - Visual check: `output/web-game/frame-gap-custom-2026-02-24/with-custom-fields.png`.
+- Layout update per request:
+  - Moved primary grid-mode buttons/toggles to left-side control row: `Drag`, `FK Limits`, `Refine`, `Timeline`.
+  - Removed separate top-right `Drag` and `FK Limits` buttons in grid mode.
+  - Moved timeline panel to the right side of canvas.
+- Timeline visual alignment with Refine panel:
+  - Restyled timeline container to match refine-panel visual language (`border rounded shadow-xl backdrop-blur-sm`, same dark panel background/border treatment and header style).
+- Kept timeline scrolling behavior and validated after right-side move:
+  - Wheel scrolling remains attached to timeline panel.
+  - Arrow/page scroll controls remain.
+  - Verified via Playwright that timeline advances (e.g., top slot from `F1` to `F5` after scroll-down clicks).
+- Validation:
+  - `npm run build` passes.
+  - `npm test -- --run` passes.
+  - Screenshots:
+    - `output/web-game/layout-left-controls-right-timeline-2026-02-24/state-1-layout.png`
+    - `output/web-game/layout-left-controls-right-timeline-2026-02-24/state-2-scrolled.png`
+    - `output/web-game/layout-left-controls-right-timeline-2026-02-24/state-3-scrolled-via-button.png`
+- Refined timeline tween UX in `components/CanvasGrid.tsx`:
+  - Replaced redundant `- / +` segment duration controls with a clearer per-segment slider + numeric field.
+  - Kept `Auto` reset for full-span interpolation.
+  - Added per-break `Add Tween` action that calls `onInsertTweenBetween(from,to)` to insert a singular in-between keyframe.
+- Refined IK/AI labels to reduce redundancy and improve clarity in the refine panel:
+  - `IK Experience` -> `Solver Style`
+  - `Leg Intent` -> `Leg Motion`
+  - `Counterpart Reactions` -> `Body Reactions`
+  - `Advanced Controls` -> `Advanced`
+  - Removed persistent redundant “Current style” line; only shows `Custom style` when user settings no longer match presets.
+  - Updated advanced toggle labels for clearer intent (`FK-IK Blend`, `Free Root Rotation`, `Ignore Joint Limits`, etc.).
+- Updated quick preset copy to be more direct and less repetitive.
+- Validation:
+  - `npm run build` passes.
+  - `npm test -- --run` passes (12 tests).
+  - Playwright visual verification screenshots:
+    - `output/web-game/ui-refine-tween-2026-02-24/state-3-segment-controls.png`
+    - `output/web-game/ui-refine-tween-2026-02-24/state-4-ik-refine-open.png`
+    - `output/web-game/ui-refine-tween-2026-02-24/state-5-after-add-tween.png` (confirms `Add Tween` increments keys from 2 -> 3).
+- Anti-jitter playback pass (requested):
+  - Updated `App.tsx` playback loop from incremental delta stepping to an absolute playback clock (`startTimeMs + fps`) for stable frame progression while playing.
+  - Playback still auto-stops at the last posed frame and returns to first posed frame, but now with deterministic time-based progression to reduce micro-jitter.
+- Added playback interaction lock in `components/CanvasGrid.tsx`:
+  - While `isPlaying`, drag/hover interactions are cleared and mouse editing is blocked.
+  - Prevents IK/FK interaction state churn during preview playback.
+  - Runtime refs no longer reset IK smoothing/fk slider buffers each playback tick.
+- Validation:
+  - `npm run build` passes.
+  - `npm test -- --run` passes (12 tests).
+  - Playwright runtime check screenshot: `output/web-game/playback-stability-2026-02-24/state-after-play.png`.
+- Added posture assist controls for IK dragging:
+  - New movement toggle fields: `postureState` (`stand` | `kneel` | `ground_sit`) and `postureRoll` (0..1).
+  - App defaults + effective movement toggles now include posture state/roll.
+  - IK refine UI now includes one-tap posture buttons (Stand/Kneel/Ground Sit), roll slider, and quick `Sit Down` / `Stand Up` actions.
+- Extended `ikLegIntent.ts` to apply posture-roll offsets independent of active drag chain, enabling smooth roll in/out of kneeling and ground-sit during IK interaction.
+- Extended tests in `ikLegIntent.test.ts` for kneel and ground-sit posture roll behavior.
+- Validation after posture assist: `npm test` (14 tests) and `npm run build` pass.
+- Researched open-source refinement options for IK/posture workflows (THREE.IK, Fullik/FIK, closed-chain-ik-js, Godot SkeletonModification2D + AnimationTree, Blender Rigify/NLA references).
+- Validation rerun after posture-roll integration:
+  - `npm test -- --run` passes (3 files, 14 tests).
+  - `npm run build` passes.
+- Researched open-source refinement candidates for sit/kneel/ground-sit IK workflow (for follow-up implementation guidance): three.js CCDIKSolver, jsantell/THREE.IK, gkjohnson/closed-chain-ik-js, Fullik, XState, Blender Rigify.
+- UX-first-pass implementation for user-friendliness in `components/CanvasGrid.tsx`:
+  - Increased control readability and hit area in grid-mode timeline + refine surfaces (larger typography and larger button/input padding).
+  - Replaced shorthand action copy with explicit labels across primary controls and timeline actions.
+    - Examples: `Drag` -> `Interaction`, `FK Limits` -> `Joint Limits`, `Refine` -> `Motion Settings`, `+Key/-Key` -> `Add/Remove Keyframe`, `SNAP/EDIT/DEL` -> `Capture Pose/Select Frame/Clear Pose`.
+  - Added a new `Basic/Advanced` mode split for both timeline and refine panels.
+    - Timeline basic mode keeps core playback/keyframe/slot controls.
+    - Timeline advanced mode exposes detailed timing and interpolation controls (fps/frame/easing, page scroll, frame-step presets/manual, tween duration controls).
+    - Refine basic mode keeps core FK/IK controls.
+    - Refine advanced mode unlocks per-joint FK sliders plus posture/body-reaction/expert IK controls.
+  - Added mode state and guardrails:
+    - `timelinePanelMode` (`basic` | `advanced`)
+    - `refinePanelMode` (`basic` | `advanced`)
+    - Auto-hides nested IK expert controls when refine mode returns to basic.
+  - Updated timeline sizing heuristics for larger controls (`timelineRailWidth`, `timelineSlotsVisible`) to reduce crowding.
+- Validation after UX-first-pass:
+  - `npm run build` passes.
+  - `npm test -- --run` passes (3 files, 14 tests).
+  - Playwright client run succeeds with elevated sandbox and outputs screenshot artifact:
+    - `output/web-game/ui-first-pass-2026-02-24/shot-0.png`
+  - Note: this client capture is canvas-focused and does not include full DOM overlay panels in the output image.
+- Follow-up fix after UX-first-pass:
+  - Exposed timeline mode toggle in header (`Mode: Basic/Advanced`) so advanced controls are user-reachable.
+  - Added safe upper-bound clamp for `Next Frame` navigation in timeline controls to prevent stepping beyond last frame.
+- Re-validation after follow-up fix:
+  - `npm run build` passes.
+  - `npm test -- --run` passes (3 files, 14 tests).
+- Final Playwright skill-client rerun after follow-up UX fix:
+  - Command completed and wrote screenshot artifact: `output/web-game/ui-first-pass-2026-02-24-final/shot-0.png`.
+- IK pinning + scope refinement pass for user report ("Balanced shoots legs up"):
+  - Removed stale all-chain target reuse during IK drag; solve now builds target set from active drag target + intent assists + optional ground pins only.
+  - Added drag-seeded ground pin capture for leg effectors and selective pin application (both legs for non-leg drags, opposite leg for leg drags) in non-single-chain solve modes.
+  - Ground pins auto-relax for sit/jump/posture-roll workflows to avoid fighting deliberate leg folding.
+- Grid/model baseline alignment pass:
+  - Grid baseline (bottom head line + ring circle bottom) now anchors to canvas bottom in grid-only mode.
+  - Model projection y-offset now derives from reference heel world position so default feet align with baseline.
+  - Synced head-grid hover projection math to updated grid y-offset.
+- Validation:
+  - `npm test -- --run` passes (14/14).
+  - `npm run build` passes.
+  - Playwright smoke run succeeded after escalation; screenshot: `output/web-game/pinning-grid-baseline-2026-02-24/shot-0.png`.
+- Dynamic frame count update:
+  - `App.tsx` now initializes animation timeline with `frameCount = 1` (instead of a fixed 60).
+  - Added `ensureFrameCapacity(frame)` helper to grow clip capacity on demand when navigating/saving into higher frames.
+  - Added `handleSetCurrentFrame(frame)` that auto-expands timeline length before setting current frame.
+  - Wired `handleSetCurrentFrame` into timeline strip and `CanvasGrid` frame setter callbacks.
+- Timeline controls/menu minimization update:
+  - Added `timelineControlsMinimized` state in `components/CanvasGrid.tsx`.
+  - Added header toggle (`Controls: Shown/Hidden`) to collapse/expand controls above frame slots.
+  - Frame-slot visibility now increases when controls are hidden (more slots shown in right panel).
+- Frame navigation behavior for dynamic growth:
+  - `Next Frame` now increments frame index without clamping to current frameCount max, enabling on-demand frame growth.
+  - `Previous Frame` remains clamped at frame 1 boundary.
+  - Default timeline frame-step changed from 2 to 1 so newly added frames are visible immediately.
+- Validation:
+  - `npm run build` passes.
+  - `npm test -- --run` passes (14 tests).
+  - Playwright screenshots:
+    - `output/web-game/dynamic-frames-menu-collapse-2026-02-24/state-1-initial.png`
+    - `output/web-game/dynamic-frames-menu-collapse-2026-02-24/state-2-after-next.png` (shows frame counter grows to `FRAME 2/2`)
+    - `output/web-game/dynamic-frames-menu-collapse-2026-02-24/state-3-controls-hidden.png` (controls collapsed, more frame tiles visible)
+- Layout pass for requested 4:3 + full-height timeline console:
+  - `components/CanvasGrid.tsx` now reserves right-side width for timeline as `TIMELINE_RAIL_WIDTH + gap` and computes a centered 4:3 `sceneViewport` in the remaining left area.
+  - Updated interaction/world centers in grid mode to use `sceneViewport.center` (FK/IK handshake, mouse down/move solving paths) so drag math stays aligned with the recentered viewport.
+  - Renderer call now passes `viewWindow: sceneViewport` so grid/circle/figure projection uses the same 4:3 viewport contract.
+  - Right timeline panel now anchors `top:0; bottom:0; right:0` and uses full-height flex layout (`h-full`) with scrollable frame-list region.
+  - Top console buttons now behave as console selection: selecting `Motion Settings` turns `Timeline Panel` off, selecting `Timeline Panel` turns `Motion Settings` off.
+- Validation:
+  - `npm run build` passes.
+  - `npm test -- --run` passes (14/14).
+  - Playwright DOM-level verification screenshots:
+    - `output/web-game/layout-top-bottom-2026-02-24-dom/state-timeline-selected.png`
+    - `output/web-game/layout-top-bottom-2026-02-24-dom/state-motion-selected.png`
+    - `output/web-game/layout-top-bottom-2026-02-24-dom/state-timeline-reselected.png`
+  - Captured button-state check during run:
+    - timeline on label observed
+    - selecting Motion toggles Timeline off
+    - reselecting Timeline toggles Motion off
+- Jitter fix (animation active) in grid-mode projection:
+  - Root cause: projection ground anchoring was derived from `bitruviusData.initialRotations`, which in this app is the live animated pose during playback. This caused per-frame y-offset drift/jitter.
+  - `components/CanvasGrid.tsx` now computes projection anchor from a stable reference pose (`T-Pose` fallback `Neutral`) via `projectionReferenceRotations` and uses that for heel-based model y-offset.
+  - `renderer.ts` now mirrors the same stable projection anchor (`T-Pose`/`Neutral`) for renderer-side model projection offset.
+- Validation:
+  - `npm run build` passes.
+  - `npm test -- --run` passes (14 tests).
+  - Playwright screenshots for post-fix sanity captured in `output/web-game/jitter-fix-2026-02-24/`.
+- Pose capture fix + simplification pass:
+  - `components/CanvasGrid.tsx` timeline slot labels are no longer clamped to `frameCount`; slots now show sequential target frames (e.g., Frame 1, Frame 2, Frame 3) even when starting from a 1-frame clip.
+  - Added virtual timeline range (`timelineVirtualFrameCount`) so users can scroll/capture into future frames before they exist in clip storage.
+  - Increased frame-step ceiling baseline (`maxTimelineStepFrames`) so quick gap presets remain usable in tiny clips.
+  - Simplified timeline copy and capture actions:
+    - top buttons `Add Keyframe` -> `Capture Current`, `Remove Keyframe` -> `Clear Current`
+    - per-slot removed redundant `Select Frame` button; slot click still selects frame, single action button is now `Capture Here`.
+- `App.tsx` capture behavior simplified:
+  - `handleSavePoseToFrame` now also moves current frame to the captured slot for direct continuation (`FRAME n/n` updates immediately).
+- Validation:
+  - `npm run build` passes.
+  - `npm test -- --run` passes (14 tests).
+  - Playwright verification: `output/web-game/capture-simplify-2026-02-24/timeline-capture-simplified.png`
+  - DOM check confirmed sequential slot labels and capture-to-frame update (`topFrameLabel: FRAME 2/2`).
+- Added requested timeline footer controls in `components/CanvasGrid.tsx`:
+  - New bottom `Back to 1` button (returns to frame 1 / internal frame 0). If playback is active, it pauses first via existing toggle and then jumps to frame 1.
+  - New motion-function quick buttons: `Fluid`, `Elastic`, `Rigid`, `Snapback`.
+  - Function presets map to easing selections:
+    - Fluid -> `easeInOutQuad`
+    - Elastic -> `easeOutQuad`
+    - Rigid -> `linear`
+    - Snapback -> `easeInQuad`
+  - Active function button reflects current easing state.
+- Validation:
+  - `npm run build` passes.
+  - `npm test -- --run` passes (14 tests).
+  - Playwright check confirms all controls visible in timeline footer and screenshot saved to:
+    - `output/web-game/timeline-footer-functions-2026-02-24/timeline-footer-functions.png`
+- IK refine UX cleanup pass:
+  - Renamed top-left toggle to `Refine` and widened refine panel (`320px`) for readability.
+  - Reorganized IK panel into clearer sections for quick use: `IK Presets`, `Pose + Weight`, `Leg Motion`, and `Posture` always visible.
+  - Added directional quick pose buttons (`Front/Left/Right/Back`) plus `Weight Shift (L/R)` and `Depth Shift (Back/Front)` sliders.
+  - Added one-tap `Reset Pose` and `Neutral Stance` actions.
+  - Kept solver internals and body-reaction toggles in Advanced mode.
+- Runtime behavior additions for new controls:
+  - Added `poseDirection`, `weightShiftLateral`, `weightShiftDepth` to movement toggles contract and app defaults/effective toggles.
+  - Added directional + weight shift assist in `ikLegIntent.ts` so IK drag applies pelvis/torso/leg biasing for left/right/back/front posing.
+- Tests/build:
+  - `npm test -- --run` passes (3 files, 16 tests).
+  - `npm run build` passes.
+- Visual smoke:
+  - Playwright canvas capture succeeded: `output/web-game/ik-refine-ux-weights-2026-02-24/shot-0.png`.
+- Phase 1 (background/foreground upload pipeline) implemented across app + renderer:
+  - `renderer.ts` now accepts `backgroundLayer` and `foregroundLayer` in `RenderOptions`, caches layer images by URL, and renders BG before grid/model + FG after model/debug overlays.
+  - `App.tsx` now owns `ImageLayerState` for BG/FG, with blob URL lifecycle handling (`URL.createObjectURL` + revoke on replace/clear/unmount).
+  - `App.tsx` now passes upload/clear/patch callbacks and current BG/FG layer state into `CanvasGrid`.
+  - `components/CanvasGrid.tsx` now includes advanced timeline controls for BG/FG upload, clear, visibility, opacity, X/Y position, scale, and foreground blend mode.
+  - `components/CanvasGrid.tsx` now forwards BG/FG layer state to the renderer call.
+- Validation after BG/FG integration:
+  - `npm run build` passes.
+  - `npm test -- --run` passes (3 files, 16 tests).
+  - Playwright skill-client run required unsandboxed execution due Chromium sandbox/Mach port restriction in sandbox; successful artifact captured at `output/web-game/bg-fg-upload-phase1-2026-02-24/shot-0.png`.
+- Note: current Playwright client artifact is canvas-focused and does not include DOM overlay panels, so timeline-panel controls were validated primarily via code path + compile/test checks in this pass.
+- Updated top-left console toggles to allow concurrent IK/FK controls + animation timeline visibility.
+- `components/CanvasGrid.tsx` changes:
+  - `Motion Settings` button now only toggles `showRefineMenu`.
+  - `Timeline Panel` button now only toggles `showAnimationTimeline`.
+  - Removed prior auto-close coupling between these two consoles.
+- Validation:
+  - `npm run build` passes.
+  - `npm test -- --run` passes (14 tests).
+- Added programmable directional IK pose slots directly in app refine UI:
+  - New persistent slot system for `Front/Left/Right/Back` pose programs with localStorage (`canvas-grid.ikPosePrograms.v1`).
+  - Each slot now has `Apply` + `Set` workflow (`Set` captures current pose-direction, weight shifts, posture, and leg-motion mode).
+  - Added sanitization for stored program payloads and safe fallback defaults.
+- IK refine UX adjustments:
+  - Renamed top-left control to `Refine`.
+  - Widened refine panel to `320px` for clearer control density.
+- Validation after programming workflow:
+  - `npm test -- --run` passes (3 files, 16 tests).
+  - `npm run build` passes.
+- Phase 2 (upload UX polish) implemented for image layers:
+  - Added `fitMode` support to `ImageLayerState` in `renderer.ts` (`free` | `contain` | `cover`).
+  - Renderer `drawImageLayer` now supports fit-based scaling against the viewport while preserving opacity/position/scale controls.
+  - `App.tsx` default layer states now include `fitMode: 'free'`.
+  - Upload behavior now resets each new BG/FG image to clean defaults (centered, visible, 100% scale, free fit) to reduce carry-over confusion from prior image settings.
+  - `components/CanvasGrid.tsx` image-layer panel now includes:
+    - Fit mode selectors (Free / Contain / Cover) for BG and FG.
+    - Per-layer Reset buttons (`Reset BG`, `Reset FG`) restoring default transform/visibility and FG blend mode.
+- Validation after phase 2:
+  - `npm run build` passes.
+  - `npm test -- --run` passes (3 files, 16 tests).
+  - Playwright skill-client verification artifact captured at:
+    - `output/web-game/bg-fg-upload-phase2-fit-reset-2026-02-24/shot-0.png`
+- Replaced Animation tab surfaces with a local Pose Library workflow in `Bitruvius-Core-Motion/src/rig-adapter/RigCoreV2Shell.tsx`:
+  - Top workflow button label now `Pose Library` (animation slot takeover).
+  - Sidebar/module title now `Pose Library`.
+  - Animation module render path now mounts `PoseLibraryPanel`.
+  - Canvas menu section renamed to `Pose Library Canvas Menu` and now mounts `PoseLibraryPanel`.
+- Added new local-only `Bitruvius-Core-Motion/src/rig-adapter/PoseLibraryPanel.tsx`:
+  - Capture current rig pose into library entries.
+  - Apply selected pose to rig.
+  - Update/duplicate/delete/clear library entries.
+  - Export selected pose or full library to JSON text.
+  - Import poses from pasted JSON or local `.json` file.
+  - Accepts snapshot shapes: direct snapshot, `{ snapshot }`, array of snapshots/wrappers, or `{ poses: [...] }`.
+- Validation:
+  - `cd Bitruvius-Core-Motion && npm run typecheck` pass.
+  - `cd Bitruvius-Core-Motion && npm run lint` pass.
+  - `cd Bitruvius-Core-Motion && npm run test` pass (9 files / 35 tests).
+  - `cd Bitruvius-Core-Motion && npm run build` pass.
+- Playwright skill-client attempt (`node web_game_playwright_client.js ...`) failed in sandbox due Chromium launch permission error (`bootstrap_check_in ... Permission denied (1100)`).
+- Seeded Pose Library with a built-in universal starter set in `Bitruvius-Core-Motion/src/rig-adapter/PoseLibraryPanel.tsx`.
+  - Added preset templates: Neutral Standing, T-Pose, A-Pose, Contrapposto, Walk Contact Left/Right, Run Contact Left/Right, Crouch, Jump Anticipation, Jump Apex, Landing, Reach Up, Reach Forward, Seated.
+  - Pose library now initializes with these presets by default (local-only; no internet).
+  - Added `Add Universal Poses` button to re-feed/append missing presets on demand (name-deduped).
+  - Preset generation now clears IK targets/poles and applies FK-friendly starter snapshots for consistent apply behavior.
+- Validation:
+  - `cd Bitruvius-Core-Motion && npm run typecheck` pass.
+  - `cd Bitruvius-Core-Motion && npm run lint` pass.
+  - `cd Bitruvius-Core-Motion && npm run test` pass (9 files / 35 tests).
+  - `cd Bitruvius-Core-Motion && npm run build` pass.
+- Flicker-reduction pass in IK drag loop (`components/CanvasGrid.tsx`):
+  - switched deadzone behavior from hard target freeze to distance-scaled continuous smoothing,
+  - added micro-target hold epsilon to ignore sub-pixel pointer noise,
+  - added rotation apply epsilon so sub-visual solve jitter does not dispatch state updates,
+  - added epsilon-based IK target state merge to avoid unnecessary render churn when target deltas are tiny.
+- Validation: `npm run build` passes.
+- Playwright skill smoke run against `http://localhost:3000` passed; screenshot at `output/web-game/post-flicker-reduction-2026-02-23/shot-0.png` with no `errors-*.json` emitted.
+- Timeline tween usability update (`components/CanvasGrid.tsx`):
+  - `In-Betweens` decrement/increment controls and `+ Auto Save Tween` now show in both `Basic` and `Advanced` timeline modes.
+  - Advanced mode still keeps the duration slider/number and `Use Auto`; basic mode keeps a simplified card with direct in-between +/- and autosave tween.
+- Validation after timeline tween update:
+  - `npm run build` passes.
+  - `npm test -- --run` passes (3 files, 16 tests).
+- Playwright check in this environment is still limited by sandbox browser constraints; attempted run produced a screenshot at `output/web-game/inbetween-autosave-check-2026-02-24/shot-0.png` but interactive selector click timed out.
+- Added `Lotte` mode inspired by Lotte Reiniger silhouette-film aesthetics.
+- Runtime wiring:
+  - New app-level `lotteMode` state in `App.tsx`.
+  - Added `Lotte On/Off` toggle in grid-top control row (and non-grid toolbar parity button).
+  - Added `lm` token to standardized state string encode/decode.
+  - Passed `lotteMode` through `CanvasGrid` into renderer.
+- Renderer treatment (`renderer.ts`) when `lotteMode` is enabled:
+  - Parchment-style radial background fill.
+  - Sepia/bronze grid + ring palette remap.
+  - Silhouette-first body rendering with warm cutout edge highlights.
+  - Warm connector/joint colors for paper-cut style contrast.
+  - Added subtle film-look overlay (vignette, dust/scratch speckle, frame border).
+- Validation:
+  - `npm run build` passes.
+  - `npm test -- --run` passes (3 files, 16 tests).
+  - Playwright skill-client run completed and artifact captured: `output/web-game/lotte-mode-verified-2026-02-24/shot-0.png`.
+  - Additional unsandboxed Playwright probe verified button state change and visual canvas delta:
+    - Button text transition: `Lotte Off` -> `Lotte On`.
+    - Canvas snapshot size delta: `302073` -> `889870` bytes.
+    - Probe artifacts:
+      - `output/web-game/lotte-probe-before-2026-02-24.png`
+      - `output/web-game/lotte-probe-after-2026-02-24.png`
+- Increased default IK interaction speed to ~2x in `CanvasGrid`:
+  - Added `IK_SPEED_MULTIPLIER = 2` and alpha-scaling helper.
+  - Scaled target smoothing alphas and rotation blend alphas to match doubled response.
+  - Doubled per-frame rotation step caps for both normal and low-friction chains.
+- Validation:
+  - `npm test -- --run` passes (16/16).
+  - `npm run build` passes.

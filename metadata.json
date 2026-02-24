@@ -1,0 +1,14 @@
+{
+  "name": "Canvas Grid Builder",
+  "description": "A React application displaying a canvas with customizable grid overlays, including a major grid, a subgrid, and a rule of thirds guide, now with an integrated Bitruvius anatomical skeleton.",
+  "requestFramePermissions": [],
+  "meta": {
+    "version": "1.1",
+    "author": "Bitruvius Systems Engine",
+    "model_type": "Advanced 2.5D Cardboard Poser"
+  },
+  "skeleton": {
+    "name": "Bitruvius Anatomical Model (Extended)",
+    "description": "A hierarchical skeleton derived from the Bitruvius Core Motion spec, now with refined joint taxonomy, extended hand/foot articulation, and color-coded labels for joints and bone segments."
+  }
+}

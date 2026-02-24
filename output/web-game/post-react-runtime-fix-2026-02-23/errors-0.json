@@ -1,0 +1,6 @@
+[
+  {
+    "type": "pageerror",
+    "text": "Error: AnimationClip requires at least one of frameCount or durationMs"
+  }
+]

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Pose Engine Locomotion"
+  short_description: "Local locomotion shortcuts for pose rigs"
+  default_prompt: "Expand this local pose engine with FK/IK movement shortcuts and keypoint-driven locomotion macros."
