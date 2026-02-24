@@ -1,11 +1,19 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react';
-import { d2r, r2d, normA, clamp } from '../utils';
+import { r2d, normA, clamp } from '../utils';
 import { BitruviusData, IKActivationStage, IKChain, SkeletonRotations, WorldCoords } from '../modelData';
+import { computeJointWorldForPose } from '../fkEngine';
 import { solveIK_AdvancedWithResult } from '../ikSolver';
-import { render, type GhostFrameRender, type ImageLayerState, type VisualModuleState } from '../renderer';
-import { createVitruvianGridModel, createVitruvianPlotPayload } from '../adapters/vitruvianGrid';
+import { render, type BodyPartMaskLayer, type GhostFrameRender, type ImageLayerState, type VisualModuleState } from '../renderer';
+import { createVitruvianRuntimeGeometry } from '../adapters/vitruvianGrid';
 import { applyHumanAssist } from '../ikHumanAssist';
 import { type JumpAssistState, type LegIntentMode, type PoseDirection, type PostureState, resolveLegIntent } from '../ikLegIntent';
+import {
+  DEFAULT_SEGMENT_IK_TWEEN_SETTINGS,
+  normalizeSegmentIkTweenSettings,
+  segmentKey as segmentIkTweenKey,
+  type SegmentIkTweenMap,
+  type SegmentIkTweenSettings,
+} from '../animationIkTween';
 
 
 
@@ -16,6 +24,8 @@ export interface MovementToggles {
   naturalBendEnabled?: boolean;
   fk360Enabled?: boolean;
   fkConstraintsEnabled?: boolean;
+  fkBendEnabled?: boolean;
+  fkStretchEnabled?: boolean;
   handshakeEnabled?: boolean;
   fkRotationSensitivity?: number;
   fkRotationResponse?: number;
@@ -56,6 +66,7 @@ interface CanvasGridProps {
   ruleOfThirdsColor: string;
   ruleOfThirdsWidth: number;
   bitruviusData: BitruviusData;
+  currentRotations?: SkeletonRotations;
   mocapMode?: boolean;
   safeSwitch?: boolean;
   silhouetteMode?: boolean;
@@ -78,12 +89,16 @@ interface CanvasGridProps {
   visualModules?: Partial<VisualModuleState>;
   backgroundImageLayer?: ImageLayerState;
   foregroundImageLayer?: ImageLayerState;
+  bodyPartMaskLayers?: Record<string, BodyPartMaskLayer | undefined>;
   onUploadBackgroundImageLayer?: (file: File) => void;
   onUploadForegroundImageLayer?: (file: File) => void;
+  onUploadBodyPartMaskLayer?: (jointId: string, file: File) => void;
   onClearBackgroundImageLayer?: () => void;
   onClearForegroundImageLayer?: () => void;
+  onClearBodyPartMaskLayer?: (jointId: string) => void;
   onPatchBackgroundImageLayer?: (patch: Partial<ImageLayerState>) => void;
   onPatchForegroundImageLayer?: (patch: Partial<ImageLayerState>) => void;
+  onPatchBodyPartMaskLayer?: (jointId: string, patch: Partial<BodyPartMaskLayer>) => void;
   gridOnlyMode?: boolean;
   onExitGridView?: () => void;
   isPlaying?: boolean;
@@ -111,6 +126,12 @@ interface CanvasGridProps {
   onRemovePoseAtFrame?: (frame: number) => void;
   segmentInterpolationFrames?: Record<string, number>;
   onSetSegmentInterpolation?: (fromFrame: number, toFrame: number, frames: number | null) => void;
+  segmentIkTweenMap?: SegmentIkTweenMap;
+  onPatchSegmentIkTween?: (
+    fromFrame: number,
+    toFrame: number,
+    patch: Partial<SegmentIkTweenSettings> | null
+  ) => void;
 }
 
 interface HeadGridHoverInfo {
@@ -133,11 +154,6 @@ interface IKBackHandle {
   hitRadiusPx: number;
 }
 
-const HEAD_PIECE_MODEL_BOUNDS = {
-  width: 52.8,
-  height: 54,
-};
-
 const DEFAULT_IMAGE_LAYER: ImageLayerState = {
   src: null,
   visible: true,
@@ -149,10 +165,44 @@ const DEFAULT_IMAGE_LAYER: ImageLayerState = {
   blendMode: 'source-over',
 };
 
+const DEFAULT_BODY_PART_MASK_LAYER: BodyPartMaskLayer = {
+  src: null,
+  visible: true,
+  opacity: 1,
+  scale: 100,
+  mode: 'projection',
+  rotationDeg: 0,
+  skewXDeg: 0,
+  skewYDeg: 0,
+  offsetX: 0,
+  offsetY: 0,
+  blendMode: 'source-over',
+  filter: 'none',
+};
+
+const BODY_PART_MASK_SCALE_MIN = 25;
+const CONSOLE_PANEL_BACKGROUND = 'rgba(18, 16, 24, 0.5)';
+
 const IMAGE_FIT_MODE_OPTIONS: Array<{ value: NonNullable<ImageLayerState['fitMode']>; label: string }> = [
   { value: 'free', label: 'Free' },
   { value: 'contain', label: 'Contain' },
   { value: 'cover', label: 'Cover' },
+];
+
+const BODY_PART_MASK_MODE_OPTIONS: Array<{ value: NonNullable<BodyPartMaskLayer['mode']>; label: string }> = [
+  { value: 'projection', label: 'Projection' },
+  { value: 'costume', label: 'Costume' },
+];
+
+const BODY_PART_MASK_FILTER_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: 'none', label: 'None' },
+  { value: 'grayscale(100%)', label: 'Grayscale' },
+  { value: 'sepia(100%)', label: 'Sepia' },
+  { value: 'contrast(135%)', label: 'Contrast+' },
+  { value: 'saturate(145%)', label: 'Saturate+' },
+  { value: 'brightness(120%)', label: 'Bright+' },
+  { value: 'hue-rotate(90deg)', label: 'Hue Shift' },
+  { value: 'blur(1.2px)', label: 'Soft Blur' },
 ];
 
 const FOREGROUND_BLEND_OPTIONS: Array<{ value: GlobalCompositeOperation; label: string }> = [
@@ -216,6 +266,9 @@ const IK_ROTATION_BLEND_ALPHA_LOW_FRICTION = scaleIkAlphaForSpeed(0.26);
 const IK_ROTATION_STEP_MAX = 7.5 * IK_SPEED_MULTIPLIER;
 const IK_ROTATION_STEP_MAX_LOW_FRICTION = 4.2 * IK_SPEED_MULTIPLIER;
 const IK_ROTATION_APPLY_EPSILON_DEG = 0.03;
+const FK_ROTATION_NOISE_EPSILON_DEG = 0.04;
+const FK_ROTATION_APPLY_EPSILON_DEG = 0.03;
+const FK_ROTATION_STEP_MAX = 8.4;
 const FK_GROUND_LITE_IK_BLEND_ALPHA = 0.72;
 const FK_GROUND_LITE_IK_MAX_STEP = 9;
 const FK_GROUND_LITE_TOE_PROXY_GAIN = 0.08;
@@ -296,48 +349,6 @@ const LEG_CHAIN_IDS: LegChainId[] = ['l_leg', 'r_leg'];
 const LEG_EFFECTOR_BY_CHAIN: Record<LegChainId, 'l_heel' | 'r_heel'> = {
   l_leg: 'l_heel',
   r_leg: 'r_heel',
-};
-
-const computeJointWorldForPose = (
-  jointId: string,
-  jointDefs: BitruviusData['JOINT_DEFS'],
-  rotations: SkeletonRotations,
-  canvasCenter: [number, number],
-  rootTransform?: { x?: number; y?: number; rotate?: number }
-): WorldCoords => {
-  const path: string[] = [];
-  let cur: string | null = jointId;
-  while (cur) {
-    path.unshift(cur);
-    cur = jointDefs[cur]?.parent ?? null;
-  }
-
-  const rootX = rootTransform?.x ?? 0;
-  const rootY = rootTransform?.y ?? 0;
-  const rootRotate = rootTransform?.rotate ?? 0;
-  let wx = canvasCenter[0] + rootX;
-  let wy = canvasCenter[1] + rootY;
-  let wa = d2r((rotations.root || 0) + rootRotate);
-  let pa = 0;
-  for (const joint of path) {
-    if (joint === 'root') {
-      pa = wa;
-      continue;
-    }
-    const jDef = jointDefs[joint];
-    if (!jDef) {
-      continue;
-    }
-    const [px, py] = jDef.pivot;
-    const c = Math.cos(wa);
-    const s = Math.sin(wa);
-    wx += px * c - py * s;
-    wy += px * s + py * c;
-    pa = wa;
-    wa += d2r(rotations[joint] || 0);
-  }
-
-  return { x: wx, y: wy, angle: normA(r2d(wa)), parentAngle: normA(r2d(pa)) };
 };
 
 const IK_STAGE_ORDER: Record<IKActivationStage, number> = {
@@ -593,6 +604,7 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
   majorGridSize,
   minorGridSize,
   bitruviusData,
+  currentRotations = bitruviusData.initialRotations,
   mocapMode = false,
   silhouetteMode = true,
   lotteMode = false,
@@ -614,12 +626,16 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
   visualModules,
   backgroundImageLayer,
   foregroundImageLayer,
+  bodyPartMaskLayers,
   onUploadBackgroundImageLayer,
   onUploadForegroundImageLayer,
+  onUploadBodyPartMaskLayer,
   onClearBackgroundImageLayer,
   onClearForegroundImageLayer,
+  onClearBodyPartMaskLayer,
   onPatchBackgroundImageLayer,
   onPatchForegroundImageLayer,
+  onPatchBodyPartMaskLayer,
   gridOnlyMode = false,
   onExitGridView,
   isPlaying = false,
@@ -647,16 +663,20 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
   onRemovePoseAtFrame,
   segmentInterpolationFrames = {},
   onSetSegmentInterpolation,
+  segmentIkTweenMap = {},
+  onPatchSegmentIkTween,
 }) => {
   const {
     stretchEnabled = true,
     softReachEnabled = true,
     naturalBendEnabled = true,
     fk360Enabled = true,
-    fkConstraintsEnabled = true,
+    fkConstraintsEnabled = false,
+    fkBendEnabled = false,
+    fkStretchEnabled = false,
     handshakeEnabled = true,
-    fkRotationSensitivity = 0.85,
-    fkRotationResponse = 0.85,
+    fkRotationSensitivity = 1,
+    fkRotationResponse = 1,
     rootX = 0,
     rootY = 0,
     rootRotate = 0,
@@ -683,20 +703,29 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
   } = movementToggles;
   const resolvedBackgroundLayer = backgroundImageLayer ?? DEFAULT_IMAGE_LAYER;
   const resolvedForegroundLayer = foregroundImageLayer ?? DEFAULT_IMAGE_LAYER;
+  const resolvedBodyPartMaskLayers = bodyPartMaskLayers ?? {};
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const backgroundUploadInputRef = useRef<HTMLInputElement>(null);
   const foregroundUploadInputRef = useRef<HTMLInputElement>(null);
-  const rotationsRef = useRef<SkeletonRotations>(bitruviusData.initialRotations);
-  const lastValidRotationsRef = useRef<SkeletonRotations>(bitruviusData.initialRotations);
+  const bodyPartMaskUploadInputRef = useRef<HTMLInputElement>(null);
+  const rotationsRef = useRef<SkeletonRotations>(currentRotations);
+  const lastValidRotationsRef = useRef<SkeletonRotations>(currentRotations);
   const ikSmoothedTargetRef = useRef<{ [chainId: string]: { x: number; y: number } }>({});
   const ikLastEventTsRef = useRef<{ [chainId: string]: number }>({});
   const ikGroundPinsRef = useRef<Partial<Record<LegChainId, { x: number; y: number }>>>({});
   const fkSliderLastInputRef = useRef<Record<string, number>>({});
+  const fkTargetRotationRef = useRef<Record<string, number>>({});
+  const fkLastEventTsRef = useRef<Record<string, number>>({});
+  const rootRotateRef = useRef(rootRotate);
   const jumpTriggerQueuedRef = useRef<boolean>(false);
   const jumpAssistStateRef = useRef<JumpAssistState>({ active: false, phase: 'idle', timerMs: 0 });
   const lastFkAngleRef = useRef<number>(0);
   const snapbackBackToFirstRafRef = useRef<number | null>(null);
+  const timelineConsoleScrollRef = useRef<HTMLDivElement>(null);
+  const timelineConsoleScrollRafRef = useRef<number | null>(null);
+  const timelineConsoleScrollTargetRef = useRef<number | null>(null);
   const prevIkInteractionRef = useRef<boolean>(ikEnabled && interactionMode === "IK");
+  const canvasResolutionRef = useRef<{ width: number; height: number; dpr: number } | null>(null);
   const [dragState, setDragState] = useState<{ id: string, type: "FK" | "IK" | "ROOT" } | null>(null);
   const [rootFkDragArmed, setRootFkDragArmed] = useState(false);
   const [hoveredJoint, setHoveredJoint] = useState<{ id: string; label: string; x: number; y: number } | null>(null);
@@ -705,6 +734,7 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
   const ikInteractionActive = ikEnabled && interactionMode === "IK";
   const [showRefineMenu, setShowRefineMenu] = useState(false);
   const [showAnimationTimeline, setShowAnimationTimeline] = useState(true);
+  const [bodyMasksEnabled, setBodyMasksEnabled] = useState(true);
   const [timelinePanelMode, setTimelinePanelMode] = useState<'basic' | 'advanced'>('basic');
   const [timelineMinimized, setTimelineMinimized] = useState(false);
   const [timelineControlsMinimized, setTimelineControlsMinimized] = useState(false);
@@ -714,6 +744,8 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
   const [dragFrameSlot, setDragFrameSlot] = useState<number | null>(null);
   const [poseLibraryFrame, setPoseLibraryFrame] = useState<number | null>(null);
   const [poseLibrarySearch, setPoseLibrarySearch] = useState('');
+  const [activeMaskUploadJointId, setActiveMaskUploadJointId] = useState<string | null>(null);
+  const [activeMaskEditorJointId, setActiveMaskEditorJointId] = useState<string | null>(null);
   const [refinePanelMode, setRefinePanelMode] = useState<'basic' | 'advanced'>('basic');
   const [showIkAdvancedControls, setShowIkAdvancedControls] = useState(false);
   const [fkBendOffsetByJoint, setFkBendOffsetByJoint] = useState<Record<string, number>>({});
@@ -793,6 +825,14 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
     foregroundUploadInputRef.current?.click();
   }, []);
 
+  const openBodyPartMaskUpload = useCallback((jointId: string, focusEditor: boolean = false) => {
+    if (focusEditor) {
+      setActiveMaskEditorJointId(jointId);
+    }
+    setActiveMaskUploadJointId(jointId);
+    bodyPartMaskUploadInputRef.current?.click();
+  }, []);
+
   const handleBackgroundUploadInput = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (file) {
@@ -808,6 +848,22 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
     }
     event.target.value = '';
   }, [onUploadForegroundImageLayer]);
+
+  const handleBodyPartMaskUploadInput = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (file && activeMaskUploadJointId) {
+      onUploadBodyPartMaskLayer?.(activeMaskUploadJointId, file);
+    }
+    event.target.value = '';
+    setActiveMaskUploadJointId(null);
+  }, [activeMaskUploadJointId, onUploadBodyPartMaskLayer]);
+
+  const maskableBodyPartIds = React.useMemo(() => {
+    return bitruviusData.RENDER_ORDER.filter((jointId) => {
+      const shape = bitruviusData.SHAPES[jointId];
+      return Boolean(shape && shape.type !== 'none');
+    });
+  }, [bitruviusData.RENDER_ORDER, bitruviusData.SHAPES]);
   
   // Requirement: List activated at start
   const [isMenuOpen, setIsMenuOpen] = useState(true);
@@ -911,7 +967,9 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
   const TIMELINE_RAIL_WIDTH = 280;
   const TIMELINE_RAIL_GAP = 10;
   const timelineReservedWidth =
-    gridOnlyMode && showAnimationTimeline ? TIMELINE_RAIL_WIDTH + TIMELINE_RAIL_GAP : 0;
+    gridOnlyMode && (showAnimationTimeline || activeMaskEditorJointId !== null)
+      ? TIMELINE_RAIL_WIDTH + TIMELINE_RAIL_GAP
+      : 0;
   const sceneViewport = React.useMemo(() => {
     if (!gridOnlyMode) {
       return {
@@ -944,25 +1002,9 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
     };
   }, [gridOnlyMode, width, height, timelineReservedWidth]);
   const projectionReferenceRotations = React.useMemo<SkeletonRotations>(() => {
-    return bitruviusData.POSES?.["T-Pose"] ?? bitruviusData.POSES?.["Neutral"] ?? bitruviusData.initialRotations;
-  }, [bitruviusData.POSES]);
-
-  const gridProjection = React.useMemo(() => {
-    if (!gridOnlyMode) {
-      return { scale: 1, yOffset: 0, center: sceneViewport.center };
-    }
-    const vitruvianModel = createVitruvianGridModel({ totalHeight: 1 });
-    const vitruvianPlot = createVitruvianPlotPayload(vitruvianModel);
-    const plotWidth = vitruvianPlot.bounds.maxX - vitruvianPlot.bounds.minX;
-    const headUnit = vitruvianModel.modules.head.unit;
-    const circleDiameter = vitruvianModel.circle.diameter;
-    const circleVerticalBuffer = headUnit * 0.5;
-    const gridScale = Math.min(
-      sceneViewport.width / plotWidth,
-      sceneViewport.height / (circleDiameter + circleVerticalBuffer * 2)
-    );
-    const headGridSquarePx = headUnit * gridScale;
-    const modelScale = headGridSquarePx / Math.max(HEAD_PIECE_MODEL_BOUNDS.width, HEAD_PIECE_MODEL_BOUNDS.height);
+    return bitruviusData.POSES?.["T-Pose"] ?? bitruviusData.POSES?.["Neutral"] ?? currentRotations;
+  }, [bitruviusData.POSES, currentRotations]);
+  const projectionReferenceHeelY = React.useMemo(() => {
     const center = sceneViewport.center;
     const leftHeel = computeJointWorldForPose(
       'l_heel',
@@ -976,108 +1018,40 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
       projectionReferenceRotations,
       center
     );
-    const referenceHeelY = Math.max(leftHeel.y, rightHeel.y);
-    const referenceHeelProjectedY = center[1] + (referenceHeelY - center[1]) * modelScale;
-    const gridGroundScreenY = sceneViewport.y + sceneViewport.height;
-    const modelYOffset = gridGroundScreenY - referenceHeelProjectedY;
-    return {
-      scale: modelScale,
-      yOffset: modelYOffset,
-      center,
-    };
-  }, [gridOnlyMode, sceneViewport, bitruviusData.JOINT_DEFS, projectionReferenceRotations]);
-  const toDisplayPoint = useCallback((x: number, y: number): { x: number; y: number } => {
-    const { scale, yOffset, center } = gridProjection;
-    return {
-      x: center[0] + (x - center[0]) * scale,
-      y: center[1] + (y - center[1]) * scale + yOffset,
-    };
-  }, [gridProjection]);
-  const fromDisplayPoint = useCallback((x: number, y: number): { x: number; y: number } => {
-    const { scale, yOffset, center } = gridProjection;
-    return {
-      x: center[0] + (x - center[0]) / scale,
-      y: center[1] + (y - center[1] - yOffset) / scale,
-    };
-  }, [gridProjection]);
+    return Math.max(leftHeel.y, rightHeel.y);
+  }, [sceneViewport.center, bitruviusData.JOINT_DEFS, projectionReferenceRotations]);
 
-  const headGridHoverMetrics = React.useMemo(() => {
-    const vitruvianModel = createVitruvianGridModel({ totalHeight: 1 });
-    const vitruvianPlot = createVitruvianPlotPayload(vitruvianModel);
-    const plotWidth = vitruvianPlot.bounds.maxX - vitruvianPlot.bounds.minX;
-    const plotMinX = vitruvianPlot.bounds.minX;
-    const plotMinY = vitruvianPlot.bounds.minY;
-    const gridTileHeight = vitruvianModel.square.height;
-    const headUnit = vitruvianModel.modules.head.unit;
-    const circleDiameter = vitruvianModel.circle.diameter;
-    const circleVerticalBuffer = headUnit * 0.5;
-    const scale = Math.min(
-      sceneViewport.width / plotWidth,
-      sceneViewport.height / (circleDiameter + circleVerticalBuffer * 2)
-    );
-    const circleCenter = vitruvianModel.circle.center;
-    const xOffset = sceneViewport.x + sceneViewport.width / 2 - (circleCenter.x - plotMinX) * scale;
-    const yOffset = gridOnlyMode ? sceneViewport.y : (circleCenter.y - plotMinY) * scale - sceneViewport.height / 2 + sceneViewport.y;
-    return {
-      plotWidth,
-      plotMinX,
-      plotMinY,
-      gridTileHeight,
-      headUnit,
-      scale,
-      xOffset,
-      yOffset,
-      viewportY: sceneViewport.y,
-      viewportHeight: sceneViewport.height,
-    };
-  }, [sceneViewport, gridOnlyMode]);
+  const runtimeGeometry = React.useMemo(() => {
+    return createVitruvianRuntimeGeometry({
+      viewWindow: sceneViewport,
+      gridOnlyMode,
+      referenceHeelY: projectionReferenceHeelY,
+    });
+  }, [sceneViewport, gridOnlyMode, projectionReferenceHeelY]);
+
+  const toDisplayPoint = useCallback((x: number, y: number): { x: number; y: number } => {
+    return runtimeGeometry.projectModelPoint(x, y);
+  }, [runtimeGeometry]);
+
+  const fromDisplayPoint = useCallback((x: number, y: number): { x: number; y: number } => {
+    return runtimeGeometry.unprojectModelPoint(x, y);
+  }, [runtimeGeometry]);
 
   const getHeadGridHoverInfo = useCallback((mx: number, my: number): Omit<HeadGridHoverInfo, "occludedByModel"> => {
-    const {
-      plotWidth,
-      plotMinX,
-      plotMinY,
-      gridTileHeight,
-      headUnit,
-      scale,
-      xOffset,
-      yOffset,
-      viewportY,
-      viewportHeight,
-    } = headGridHoverMetrics;
-    const worldX = (mx - xOffset) / scale + plotMinX;
-    const worldY = plotMinY + (viewportY + viewportHeight + yOffset - my) / scale;
-
-    const tileX = Math.floor((worldX - plotMinX) / plotWidth);
-    const tileY = Math.floor((worldY - plotMinY) / gridTileHeight);
-
-    const localX = worldX - (plotMinX + tileX * plotWidth);
-    const localY = worldY - (plotMinY + tileY * gridTileHeight);
-
-    const clampedCellX = clamp(Math.floor(localX / headUnit), 0, 7);
-    const rowFromGround = clamp(Math.floor(localY / headUnit), 0, 7);
-    const clampedCellY = 7 - rowFromGround;
-
-    const nearestLineX = Math.round(localX / headUnit) * headUnit;
-    const nearestLineY = Math.round(localY / headUnit) * headUnit;
-    const lineX = Math.abs(localX - nearestLineX) * scale <= 6;
-    const lineY = Math.abs(localY - nearestLineY) * scale <= 6;
-    const lineAxis: "x" | "y" | "xy" | "none" = lineX && lineY ? "xy" : lineX ? "x" : lineY ? "y" : "none";
-    const lineSuffix = lineAxis === "none" ? "" : ` • ${lineAxis.toUpperCase()} line`;
-
+    const hoverCell = runtimeGeometry.resolveHeadGridCell(mx, my);
     return {
-      label: `Head Grid T(${tileX},${tileY}) C(${clampedCellX},${clampedCellY})${lineSuffix}`,
+      label: hoverCell.label,
       x: mx,
       y: my,
-      tileX,
-      tileY,
-      cellX: clampedCellX,
-      cellY: clampedCellY,
-      lineAxis,
+      tileX: hoverCell.tileX,
+      tileY: hoverCell.tileY,
+      cellX: hoverCell.cellX,
+      cellY: hoverCell.cellY,
+      lineAxis: hoverCell.lineAxis,
     };
-  }, [headGridHoverMetrics]);
+  }, [runtimeGeometry]);
 
-  const headGridSquarePx = Math.max(28, Math.min(92, headGridHoverMetrics.headUnit * headGridHoverMetrics.scale));
+  const headGridSquarePx = Math.max(28, Math.min(92, runtimeGeometry.headGridSquarePx));
   const timelineSlotsVisible = timelineMinimized
     ? 1
     : timelineControlsMinimized
@@ -1193,14 +1167,41 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
   }, [poseLibraryFrame, onApplyPoseToFrame]);
 
   const handleTimelineWheel = useCallback((event: React.WheelEvent<HTMLDivElement>) => {
-    if (maxTimelineScrollIndex <= 0) {
+    const container = timelineConsoleScrollRef.current;
+    if (!container) {
+      return;
+    }
+    const maxScroll = Math.max(0, container.scrollHeight - container.clientHeight);
+    if (maxScroll <= 0) {
       return;
     }
     event.preventDefault();
-    const direction = event.deltaY > 0 ? 1 : -1;
-    const step = event.shiftKey ? timelineSlotsVisible : 1;
-    setTimelineScrollIndex((prev) => clamp(prev + direction * step, 0, maxTimelineScrollIndex));
-  }, [maxTimelineScrollIndex, timelineSlotsVisible]);
+    const currentTarget = timelineConsoleScrollTargetRef.current ?? container.scrollTop;
+    const nextTarget = clamp(currentTarget + event.deltaY, 0, maxScroll);
+    timelineConsoleScrollTargetRef.current = nextTarget;
+    if (timelineConsoleScrollRafRef.current !== null) {
+      return;
+    }
+
+    const animate = () => {
+      const element = timelineConsoleScrollRef.current;
+      if (!element) {
+        timelineConsoleScrollRafRef.current = null;
+        return;
+      }
+      const target = timelineConsoleScrollTargetRef.current ?? element.scrollTop;
+      const delta = target - element.scrollTop;
+      if (Math.abs(delta) <= 0.5) {
+        element.scrollTop = target;
+        timelineConsoleScrollRafRef.current = null;
+        return;
+      }
+      element.scrollTop += delta * 0.24;
+      timelineConsoleScrollRafRef.current = requestAnimationFrame(animate);
+    };
+
+    timelineConsoleScrollRafRef.current = requestAnimationFrame(animate);
+  }, []);
   const handleTimelineBackToFirst = useCallback(() => {
     if (!onSetCurrentFrame) {
       return;
@@ -1251,6 +1252,10 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
       if (snapbackBackToFirstRafRef.current !== null) {
         cancelAnimationFrame(snapbackBackToFirstRafRef.current);
       }
+      if (timelineConsoleScrollRafRef.current !== null) {
+        cancelAnimationFrame(timelineConsoleScrollRafRef.current);
+        timelineConsoleScrollRafRef.current = null;
+      }
     };
   }, []);
 
@@ -1276,6 +1281,12 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
       setPoseLibrarySearch('');
     }
   }, [gridOnlyMode, showAnimationTimeline, onApplyPoseToFrame, poseLibraryFrame]);
+
+  useEffect(() => {
+    if (!bodyMasksEnabled && activeMaskEditorJointId !== null) {
+      setActiveMaskEditorJointId(null);
+    }
+  }, [bodyMasksEnabled, activeMaskEditorJointId]);
 
   const computeWorld = useCallback((jointId: string, rotations: SkeletonRotations, canvasCenter: [number, number]): WorldCoords => {
     return computeJointWorldForPose(jointId, bitruviusData.JOINT_DEFS, rotations, canvasCenter, {
@@ -1375,27 +1386,38 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
 
   const setJointRotationFromWrappedSlider = useCallback((jointId: string, rawDegrees: number) => {
     const prevRaw = fkSliderLastInputRef.current[jointId]
-      ?? normA(bitruviusData.initialRotations[jointId] ?? 0);
+      ?? normA(currentRotations[jointId] ?? 0);
     const hitPositiveEdge = rawDegrees >= 180 && prevRaw < 179.5;
     const hitNegativeEdge = rawDegrees <= -180 && prevRaw > -179.5;
     const wrapped = hitPositiveEdge ? -180 : hitNegativeEdge ? 180 : rawDegrees;
     fkSliderLastInputRef.current[jointId] = wrapped;
     setJointRotationFromSlider(jointId, wrapped);
-  }, [bitruviusData.initialRotations, setJointRotationFromSlider]);
+  }, [currentRotations, setJointRotationFromSlider]);
 
 
 
 
   useEffect(() => {
-    rotationsRef.current = bitruviusData.initialRotations;
-    lastValidRotationsRef.current = bitruviusData.initialRotations;
-    if (!isPlaying) {
+    rootRotateRef.current = rootRotate;
+  }, [rootRotate]);
+
+  useEffect(() => {
+    rotationsRef.current = currentRotations;
+    lastValidRotationsRef.current = currentRotations;
+  }, [currentRotations]);
+
+  useEffect(() => {
+    if (!isPlaying && (!dragState || dragState.type !== "IK")) {
       ikSmoothedTargetRef.current = {};
       ikLastEventTsRef.current = {};
       ikGroundPinsRef.current = {};
-      fkSliderLastInputRef.current = {};
     }
-  }, [bitruviusData.initialRotations, isPlaying]);
+    if (!isPlaying && (!dragState || dragState.type !== "FK")) {
+      fkSliderLastInputRef.current = {};
+      fkTargetRotationRef.current = {};
+      fkLastEventTsRef.current = {};
+    }
+  }, [dragState, isPlaying]);
 
   useEffect(() => {
     if (!ikInteractionActive) {
@@ -1514,6 +1536,8 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
       const canDragRootRotate = rootRotateControlEnabled;
       if (!ikInteractionActive && fk360Enabled && rootFkDragArmed && canDragRootRotate) {
         lastFkAngleRef.current = r2d(Math.atan2(my - rootDisplay.y, mx - rootDisplay.x));
+        fkTargetRotationRef.current.root = rootRotateRef.current;
+        fkLastEventTsRef.current.root = performance.now();
         setDragState({ id: "root", type: "FK" });
       } else if (canDragRootPosition) {
         setDragState({ id: "root", type: "ROOT" });
@@ -1601,6 +1625,11 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
       if (controllerPos) {
         lastFkAngleRef.current = r2d(Math.atan2(my - controllerPos.y, mx - controllerPos.x));
       }
+      const initialLocal = controllerId === 'root'
+        ? rootRotateRef.current
+        : (rotationsRef.current[controllerId] ?? 0);
+      fkTargetRotationRef.current[controllerId] = initialLocal;
+      fkLastEventTsRef.current[controllerId] = performance.now();
       setDragState({ id: controllerId, type: 'FK' });
     };
     const projectPointToSegment = (
@@ -1716,7 +1745,8 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
   };
 
   const handleMouseMove = (e: React.MouseEvent) => {
-    if (isPlaying) {
+    const fkLivePoseDuringPlayback = isPlaying && (dragState?.type === 'FK' || dragState?.type === 'ROOT');
+    if (isPlaying && !fkLivePoseDuringPlayback) {
       if (dragState) {
         setDragState(null);
       }
@@ -1759,7 +1789,11 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
       const lim = bitruviusData.JOINT_LIMITS[id];
       const allow360 = fk360Enabled;
       const applyFkConstraints = fkConstraintsEnabled;
-      const previousLocal = id === 'root' ? rootRotate : (rotationsRef.current[id] ?? 0);
+      const previousLocal = id === 'root' ? rootRotateRef.current : (rotationsRef.current[id] ?? 0);
+      const now = performance.now();
+      const previousEventTs = fkLastEventTsRef.current[id] ?? now;
+      const dtMs = Math.max(0, now - previousEventTs);
+      fkLastEventTsRef.current[id] = now;
       const isLegControl = id === 'l_hip' || id === 'l_knee' || id === 'l_heel' || id === 'r_hip' || id === 'r_knee' || id === 'r_heel';
       const activeLegSide = id.startsWith('l_') ? 'l' : id.startsWith('r_') ? 'r' : null;
       const stanceEffectorId: 'l_heel' | 'r_heel' | null = activeLegSide === 'l'
@@ -1775,34 +1809,45 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
                 computeWorld('r_heel', rotationsRef.current, center).y
               ))
         : null;
-      let local: number;
+      const previousTargetLocal = fkTargetRotationRef.current[id] ?? previousLocal;
+      let targetLocal: number;
       if (allow360) {
-        const pivot = id === "root" ? worldDisplay : worldDisplay;
-        const newAngle = r2d(Math.atan2(my - pivot.y, mx - pivot.x));
-        const delta = normA(newAngle - lastFkAngleRef.current);
+        const newAngle = r2d(Math.atan2(my - worldDisplay.y, mx - worldDisplay.x));
+        const rawDelta = normA(newAngle - lastFkAngleRef.current);
         lastFkAngleRef.current = newAngle;
-        local = previousLocal + delta;
+        const delta = Math.abs(rawDelta) <= FK_ROTATION_NOISE_EPSILON_DEG ? 0 : rawDelta;
+        targetLocal = previousTargetLocal + delta;
       } else {
-        local = normA(r2d(Math.atan2(my - worldDisplay.y, mx - worldDisplay.x)) - pWorld.angle);
-        if (allow360) lastFkAngleRef.current = local;
-        else if (applyFkConstraints && lim) local = clamp(local, lim.min, lim.max);
+        targetLocal = normA(r2d(Math.atan2(my - worldDisplay.y, mx - worldDisplay.x)) - pWorld.angle);
+        if (applyFkConstraints && lim) targetLocal = clamp(targetLocal, lim.min, lim.max);
       }
+      fkTargetRotationRef.current[id] = targetLocal;
       const fkRotationFluidity = clamp((fkRotationSensitivity + fkRotationResponse) / 2, 0.35, 1.6);
-      if (fkRotationFluidity !== 1) {
-        local = previousLocal + normA(local - previousLocal) * fkRotationFluidity;
-      }
+      const fluidityAlpha = fkRotationFluidity >= 1
+        ? 1
+        : resolveTemporalAlpha(fkRotationFluidity, dtMs || IK_BASE_FRAME_MS);
+      const dtScale = clamp(dtMs || IK_BASE_FRAME_MS, IK_EVENT_DT_MIN_MS, IK_EVENT_DT_MAX_MS) / IK_BASE_FRAME_MS;
+      const maxStep = FK_ROTATION_STEP_MAX * Math.max(0.55, fkRotationFluidity) * dtScale;
+      let local = previousLocal + clamp(
+        normA(targetLocal - previousLocal) * fluidityAlpha,
+        -maxStep,
+        maxStep
+      );
       if (!allow360 && applyFkConstraints && lim) local = clamp(local, lim.min, lim.max);
       const nextRots = id === 'root'
         ? { ...rotationsRef.current }
         : { ...rotationsRef.current, [id]: local };
       const localDelta = normA(local - previousLocal);
+      if (Math.abs(localDelta) <= FK_ROTATION_APPLY_EPSILON_DEG) {
+        return;
+      }
       if (Math.abs(localDelta) > 1e-6 && id !== 'root') {
         const directChildren = Object.entries(bitruviusData.JOINT_DEFS)
           .filter(([, def]) => def.parent === id)
           .map(([jointId]) => jointId);
 
         const bendOffset = clamp(fkBendOffsetByJoint[id] ?? 0, -12, 12);
-        if (bendOffset !== 0) {
+        if (fkBendEnabled && bendOffset !== 0) {
           const bendGain = bendOffset / 12;
           directChildren.forEach((childId) => {
             const prev = nextRots[childId] ?? 0;
@@ -1815,7 +1860,7 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
         }
 
         const stretchOffset = clamp(fkStretchOffsetByJoint[id] ?? 0, -12, 12);
-        if (stretchOffset !== 0) {
+        if (fkStretchEnabled && stretchOffset !== 0) {
           const stretchGain = stretchOffset / 12;
           const queue: Array<{ jointId: string; depth: number }> = directChildren.map((jointId) => ({ jointId, depth: 1 }));
           while (queue.length) {
@@ -1835,6 +1880,7 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
         }
       }
       if (id === 'root' && onMovementTogglesChange) {
+        rootRotateRef.current = local;
         onMovementTogglesChange({
           ...(movementToggles || {}),
           rootRotate: local,
@@ -2009,6 +2055,9 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
       delete ikSmoothedTargetRef.current[dragState.id];
       delete ikLastEventTsRef.current[dragState.id];
       ikGroundPinsRef.current = {};
+    } else if (dragState?.type === "FK") {
+      delete fkTargetRotationRef.current[dragState.id];
+      delete fkLastEventTsRef.current[dragState.id];
     }
     setDragState(null);
     setHoveredJoint((prev) => (prev ? null : prev));
@@ -2020,6 +2069,9 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
       delete ikSmoothedTargetRef.current[dragState.id];
       delete ikLastEventTsRef.current[dragState.id];
       ikGroundPinsRef.current = {};
+    } else if (dragState?.type === "FK") {
+      delete fkTargetRotationRef.current[dragState.id];
+      delete fkLastEventTsRef.current[dragState.id];
     }
     setDragState(null);
     setHoveredJoint((prev) => (prev ? null : prev));
@@ -2040,9 +2092,24 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
     if (!ctx) return;
 
     const dpr = window.devicePixelRatio || 1;
-    canvas.width = width * dpr;
-    canvas.height = height * dpr;
-    ctx.scale(dpr, dpr);
+    const nextCanvasWidth = Math.max(1, Math.round(width * dpr));
+    const nextCanvasHeight = Math.max(1, Math.round(height * dpr));
+    const previousResolution = canvasResolutionRef.current;
+    if (
+      !previousResolution ||
+      previousResolution.width !== nextCanvasWidth ||
+      previousResolution.height !== nextCanvasHeight ||
+      previousResolution.dpr !== dpr
+    ) {
+      canvas.width = nextCanvasWidth;
+      canvas.height = nextCanvasHeight;
+      canvasResolutionRef.current = {
+        width: nextCanvasWidth,
+        height: nextCanvasHeight,
+        dpr,
+      };
+    }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
 
 
@@ -2064,11 +2131,36 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
       visualModules,
       backgroundLayer: resolvedBackgroundLayer,
       foregroundLayer: resolvedForegroundLayer,
+      bodyPartMasks: bodyMasksEnabled ? resolvedBodyPartMaskLayers : {},
       gridOnlyMode,
+      runtimeGeometry,
       showIkDebugOverlay: ikDebugOverlayEnabled,
       headGridHover: hoveredHeadGrid,
     });
-  }, [width, height, sceneViewport, majorGridSize, minorGridSize, bitruviusData, interactionMode, ikTargets, mocapMode, silhouetteMode, lotteMode, computeWorld, ghostFrames, visualModules, resolvedBackgroundLayer, resolvedForegroundLayer, gridOnlyMode, ikDebugOverlayEnabled, hoveredHeadGrid]);
+  }, [
+    width,
+    height,
+    sceneViewport,
+    majorGridSize,
+    minorGridSize,
+    bitruviusData,
+    currentRotations,
+    ikTargets,
+    mocapMode,
+    silhouetteMode,
+    lotteMode,
+    computeWorld,
+    ghostFrames,
+    visualModules,
+    resolvedBackgroundLayer,
+    resolvedForegroundLayer,
+    resolvedBodyPartMaskLayers,
+    bodyMasksEnabled,
+    gridOnlyMode,
+    runtimeGeometry,
+    ikDebugOverlayEnabled,
+    hoveredHeadGrid,
+  ]);
 
   const gridRefineTop = UI_INSET + (onExitGridView ? 38 : 0);
   const bgOpacityPercent = Math.round(clamp(Number.isFinite(resolvedBackgroundLayer.opacity) ? resolvedBackgroundLayer.opacity : 1, 0, 1) * 100);
@@ -2082,8 +2174,217 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
   const bgFitMode = resolvedBackgroundLayer.fitMode ?? 'free';
   const fgFitMode = resolvedForegroundLayer.fitMode ?? 'free';
   const fgBlendMode = resolvedForegroundLayer.blendMode ?? 'source-over';
-  const rightRailOffset = showAnimationTimeline ? timelineRailWidth + UI_INSET : UI_INSET;
+  const loadedBodyMaskCount = maskableBodyPartIds.reduce((count, jointId) => {
+    const layer = resolvedBodyPartMaskLayers[jointId];
+    return layer?.src ? count + 1 : count;
+  }, 0);
+  const activeMaskEditorJointLabel = activeMaskEditorJointId
+    ? bitruviusData.JOINT_DEFS[activeMaskEditorJointId]?.label ?? activeMaskEditorJointId
+    : '';
+  const activeMaskEditorLayer: BodyPartMaskLayer = activeMaskEditorJointId
+    ? {
+      ...DEFAULT_BODY_PART_MASK_LAYER,
+      ...(resolvedBodyPartMaskLayers[activeMaskEditorJointId] ?? {}),
+    }
+    : DEFAULT_BODY_PART_MASK_LAYER;
+  const activeMaskOpacityPercent = Math.round(
+    clamp(Number.isFinite(activeMaskEditorLayer.opacity) ? activeMaskEditorLayer.opacity : 1, 0, 1) * 100
+  );
+  const activeMaskScalePercent = Math.round(
+    clamp(
+      Number.isFinite(activeMaskEditorLayer.scale) ? activeMaskEditorLayer.scale : 100,
+      BODY_PART_MASK_SCALE_MIN,
+      400
+    )
+  );
+  const activeMaskRotation = Math.round(
+    clamp(Number.isFinite(activeMaskEditorLayer.rotationDeg) ? activeMaskEditorLayer.rotationDeg : 0, -180, 180)
+  );
+  const activeMaskSkewX = Math.round(
+    clamp(Number.isFinite(activeMaskEditorLayer.skewXDeg) ? activeMaskEditorLayer.skewXDeg : 0, -80, 80)
+  );
+  const activeMaskSkewY = Math.round(
+    clamp(Number.isFinite(activeMaskEditorLayer.skewYDeg) ? activeMaskEditorLayer.skewYDeg : 0, -80, 80)
+  );
+  const activeMaskOffsetX = Math.round(
+    clamp(Number.isFinite(activeMaskEditorLayer.offsetX) ? activeMaskEditorLayer.offsetX : 0, -300, 300)
+  );
+  const activeMaskOffsetY = Math.round(
+    clamp(Number.isFinite(activeMaskEditorLayer.offsetY) ? activeMaskEditorLayer.offsetY : 0, -300, 300)
+  );
+  const activeMaskBlendMode = activeMaskEditorLayer.blendMode ?? 'source-over';
+  const activeMaskMode = activeMaskEditorLayer.mode ?? 'projection';
+  const activeMaskFilter = (activeMaskEditorLayer.filter ?? 'none').trim() || 'none';
+  const patchActiveMaskEditor = useCallback((patch: Partial<BodyPartMaskLayer>) => {
+    if (!activeMaskEditorJointId) {
+      return;
+    }
+    onPatchBodyPartMaskLayer?.(activeMaskEditorJointId, patch);
+  }, [activeMaskEditorJointId, onPatchBodyPartMaskLayer]);
+  const bodyMaskUploadHandles = React.useMemo(() => {
+    if (!gridOnlyMode || !bodyMasksEnabled || !maskableBodyPartIds.length) {
+      return [] as Array<{
+        jointId: string;
+        label: string;
+        shortLabel: string;
+        x: number;
+        y: number;
+        labelX: number;
+        labelY: number;
+        jointX: number;
+        jointY: number;
+        nx: number;
+        ny: number;
+        hasMask: boolean;
+      }>;
+    }
+
+    const ringCenter = runtimeGeometry.worldToScreen(
+      runtimeGeometry.model.circle.center.x,
+      runtimeGeometry.model.circle.center.y + runtimeGeometry.ringVerticalOffsetWorld
+    );
+    const ringRadiusPx = runtimeGeometry.model.circle.radius * runtimeGeometry.gridScale;
+    const baseOrbitRadiusPx = ringRadiusPx + Math.max(20, runtimeGeometry.headGridSquarePx * 0.82);
+    const minX = sceneViewport.x + 18;
+    const maxX = sceneViewport.x + sceneViewport.width - 18;
+    const minY = sceneViewport.y + 56;
+    const maxY = sceneViewport.y + sceneViewport.height - 18;
+    const center = sceneViewport.center;
+    const twoPi = Math.PI * 2;
+    const wrapAngle = (angle: number): number => {
+      let next = angle % twoPi;
+      if (next < 0) {
+        next += twoPi;
+      }
+      return next;
+    };
+    const shortestAngleDelta = (delta: number): number => {
+      let next = (delta + Math.PI) % twoPi;
+      if (next < 0) {
+        next += twoPi;
+      }
+      return next - Math.PI;
+    };
+
+    const rawHandles = maskableBodyPartIds.map((jointId, index) => {
+      const world = computeWorld(jointId, currentRotations, center);
+      const jointScreen = toDisplayPoint(world.x, world.y);
+      let vx = jointScreen.x - ringCenter.x;
+      let vy = jointScreen.y - ringCenter.y;
+      const fallbackAngle = -Math.PI / 2 + (Math.PI * 2 * index) / maskableBodyPartIds.length;
+      const magnitude = Math.hypot(vx, vy);
+      let preferredAngle = fallbackAngle;
+      if (!Number.isFinite(magnitude) || magnitude < 0.001) {
+        vx = Math.cos(fallbackAngle);
+        vy = Math.sin(fallbackAngle);
+      } else {
+        vx /= magnitude;
+        vy /= magnitude;
+        preferredAngle = Math.atan2(vy, vx);
+      }
+      preferredAngle = wrapAngle(preferredAngle);
+      const handleLabel = bitruviusData.JOINT_DEFS[jointId]?.label ?? jointId;
+      const shortLabel = handleLabel.replace(/_/g, ' ').toUpperCase();
+      return {
+        jointId,
+        label: handleLabel,
+        shortLabel,
+        jointX: jointScreen.x,
+        jointY: jointScreen.y,
+        hasMask: Boolean(resolvedBodyPartMaskLayers[jointId]?.src),
+        preferredAngle,
+      };
+    });
+
+    const angleByJoint: Record<string, number> = {};
+    rawHandles.forEach((handle) => {
+      angleByJoint[handle.jointId] = handle.preferredAngle;
+    });
+    const sortedByAngle = rawHandles
+      .slice()
+      .sort((a, b) => a.preferredAngle - b.preferredAngle);
+    const minAngleSeparation = Math.min(Math.PI / 4.2, (twoPi / Math.max(1, rawHandles.length)) * 0.9);
+    for (let iteration = 0; iteration < 28; iteration += 1) {
+      for (let i = 0; i < sortedByAngle.length; i += 1) {
+        for (let j = i + 1; j < sortedByAngle.length; j += 1) {
+          const a = sortedByAngle[i];
+          const b = sortedByAngle[j];
+          const diff = shortestAngleDelta(angleByJoint[b.jointId] - angleByJoint[a.jointId]);
+          const absDiff = Math.abs(diff);
+          if (absDiff >= minAngleSeparation) {
+            continue;
+          }
+          const push = (minAngleSeparation - absDiff) * 0.6;
+          const sign = diff >= 0 ? 1 : -1;
+          angleByJoint[a.jointId] -= sign * push;
+          angleByJoint[b.jointId] += sign * push;
+        }
+      }
+      sortedByAngle.forEach((handle) => {
+        const currentAngle = angleByJoint[handle.jointId];
+        const towardPreferred = shortestAngleDelta(handle.preferredAngle - currentAngle) * 0.06;
+        angleByJoint[handle.jointId] = currentAngle + towardPreferred;
+      });
+    }
+
+    const maxOrbitRadiusX = Math.max(34, Math.min(ringCenter.x - minX, maxX - ringCenter.x) - 14);
+    const maxOrbitRadiusY = Math.max(34, Math.min(ringCenter.y - minY, maxY - ringCenter.y) - 14);
+    const resolvedOrbitRadiusPx = clamp(
+      baseOrbitRadiusPx,
+      34,
+      Math.max(34, Math.min(maxOrbitRadiusX, maxOrbitRadiusY))
+    );
+
+    return rawHandles.map((handle) => {
+      const angle = wrapAngle(angleByJoint[handle.jointId]);
+      const vx = Math.cos(angle);
+      const vy = Math.sin(angle);
+      const rawX = ringCenter.x + vx * resolvedOrbitRadiusPx;
+      const rawY = ringCenter.y + vy * resolvedOrbitRadiusPx;
+      const clampedX = clamp(rawX, minX, maxX);
+      const clampedY = clamp(rawY, minY, maxY);
+      const labelX = clampedX + vx * 14;
+      const labelY = clampedY + vy * 14;
+      return {
+        jointId: handle.jointId,
+        label: handle.label,
+        shortLabel: handle.shortLabel,
+        x: clampedX,
+        y: clampedY,
+        labelX,
+        labelY,
+        jointX: handle.jointX,
+        jointY: handle.jointY,
+        nx: vx,
+        ny: vy,
+        hasMask: handle.hasMask,
+      };
+    });
+  }, [
+    gridOnlyMode,
+    bodyMasksEnabled,
+    maskableBodyPartIds,
+    runtimeGeometry,
+    sceneViewport.x,
+    sceneViewport.y,
+    sceneViewport.width,
+    sceneViewport.height,
+    sceneViewport.center,
+    currentRotations,
+    computeWorld,
+    toDisplayPoint,
+    bitruviusData.JOINT_DEFS,
+    resolvedBodyPartMaskLayers,
+  ]);
+  const rightRailOffset =
+    showAnimationTimeline || activeMaskEditorJointId !== null
+      ? timelineRailWidth + UI_INSET
+      : UI_INSET;
   const poseLibraryDisplayFrame = poseLibraryFrame !== null ? poseLibraryFrame + 1 : null;
+  const defaultPoseThumb = React.useMemo(() => {
+    const sourcePose = bitruviusData.POSES?.["T-Pose"] ?? bitruviusData.POSES?.["Neutral"] ?? currentRotations;
+    return computeThumbPosePath(sourcePose);
+  }, [bitruviusData.POSES, currentRotations, computeThumbPosePath]);
 
   return (
     <div className="relative overflow-hidden" style={{ width: `${width}px`, height: `${height}px` }}>
@@ -2110,6 +2411,68 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
         onChange={handleForegroundUploadInput}
         className="hidden"
       />
+      <input
+        ref={bodyPartMaskUploadInputRef}
+        type="file"
+        accept="image/*"
+        onChange={handleBodyPartMaskUploadInput}
+        className="hidden"
+      />
+
+      {gridOnlyMode && bodyMasksEnabled && bodyMaskUploadHandles.length > 0 ? (
+        <div className="absolute inset-0 pointer-events-none" style={{ zIndex: 74 }}>
+          <svg className="absolute inset-0 w-full h-full pointer-events-none">
+            {bodyMaskUploadHandles.map((handle) => (
+              <line
+                key={`mask-link-${handle.jointId}`}
+                x1={handle.jointX}
+                y1={handle.jointY}
+                x2={handle.x}
+                y2={handle.y}
+                stroke={handle.hasMask ? 'rgba(74, 222, 128, 0.5)' : 'rgba(158, 150, 184, 0.44)'}
+                strokeWidth={1.2}
+                strokeDasharray="3 3"
+              />
+            ))}
+          </svg>
+          {bodyMaskUploadHandles.map((handle) => (
+            <React.Fragment key={`mask-handle-${handle.jointId}`}>
+              <button
+                type="button"
+                onClick={() => openBodyPartMaskUpload(handle.jointId, true)}
+                className="absolute h-6 w-6 rounded-full border text-[13px] font-bold leading-none flex items-center justify-center transition-colors pointer-events-auto"
+                style={{
+                  left: `${handle.x}px`,
+                  top: `${handle.y}px`,
+                  transform: 'translate(-50%, -50%)',
+                  background: handle.hasMask ? 'rgba(16, 88, 56, 0.82)' : 'rgba(18, 16, 24, 0.84)',
+                  borderColor: handle.hasMask ? 'rgba(74, 222, 128, 0.78)' : 'rgba(158, 150, 184, 0.72)',
+                  color: 'rgba(244, 244, 245, 0.95)',
+                }}
+                title={`Upload or replace mask for ${handle.label}`}
+              >
+                +
+              </button>
+              <button
+                type="button"
+                onClick={() => setActiveMaskEditorJointId(handle.jointId)}
+                className="absolute px-1.5 py-[2px] rounded border text-[9px] font-semibold tracking-[0.05em] uppercase pointer-events-auto transition-colors hover:bg-white/15"
+                style={{
+                  left: `${handle.labelX}px`,
+                  top: `${handle.labelY}px`,
+                  transform: 'translate(-50%, -50%)',
+                  background: 'rgba(18, 16, 24, 0.78)',
+                  borderColor: handle.hasMask ? 'rgba(74, 222, 128, 0.62)' : 'rgba(158, 150, 184, 0.52)',
+                  color: handle.hasMask ? 'rgba(220, 252, 231, 0.95)' : 'rgba(232, 228, 243, 0.95)',
+                }}
+                title={`Edit mask settings for ${handle.label}`}
+              >
+                {handle.shortLabel}
+              </button>
+            </React.Fragment>
+          ))}
+        </div>
+      ) : null}
 
       {hoveredJoint ? (
         <div
@@ -2141,10 +2504,9 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
         </div>
       ) : null}
 
-      {gridOnlyMode && showAnimationTimeline ? (
+      {gridOnlyMode && showAnimationTimeline && activeMaskEditorJointId === null ? (
         <div
           className="absolute pointer-events-auto"
-          onWheel={handleTimelineWheel}
           style={{
             top: '0px',
             bottom: '0px',
@@ -2157,7 +2519,7 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
             style={{
               width: `${timelineRailWidth}px`,
               height: '100%',
-              background: 'rgba(18, 16, 24, 0.74)',
+              background: CONSOLE_PANEL_BACKGROUND,
               borderColor: 'rgba(158, 150, 184, 0.5)',
             }}
           >
@@ -2192,7 +2554,15 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
             </div>
 
             {!timelineMinimized ? (
-              <div className="px-2.5 py-2.5 flex-1 min-h-0 flex flex-col gap-2.5">
+              <div
+                ref={timelineConsoleScrollRef}
+                onWheel={handleTimelineWheel}
+                onScroll={(event) => {
+                  timelineConsoleScrollTargetRef.current = event.currentTarget.scrollTop;
+                }}
+                className="px-2.5 py-2.5 flex-1 min-h-0 overflow-y-auto custom-scrollbar flex flex-col gap-2.5"
+                style={{ scrollBehavior: 'smooth' }}
+              >
                 {!timelineControlsMinimized ? (
                   <>
                 <div className="grid grid-cols-2 gap-1.5 border border-white/10 rounded p-2">
@@ -2597,6 +2967,36 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
                           </select>
                         </label>
                       </div>
+
+                      <div className="space-y-1.5 border border-white/10 rounded p-2">
+                        <div className="flex items-center justify-between text-[10px] tracking-[0.05em] uppercase text-zinc-400">
+                          <span>Body Masks</span>
+                          <span className="text-zinc-500">{loadedBodyMaskCount}/{maskableBodyPartIds.length}</span>
+                        </div>
+                        <div className="text-[10px] text-zinc-400 leading-snug">
+                          Use on-canvas <span className="text-zinc-200 font-semibold">+</span> handles around the ring to select a body part and open the mask editor.
+                        </div>
+                        <div className="grid grid-cols-2 gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (!maskableBodyPartIds.length) return;
+                              const fallbackJointId = maskableBodyPartIds[0];
+                              setActiveMaskEditorJointId(fallbackJointId);
+                            }}
+                            className="min-h-8 px-2 py-1 text-[10px] border border-white/15 rounded text-zinc-200 hover:bg-white/10 transition-colors"
+                          >
+                            Open Editor
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setBodyMasksEnabled((prev) => !prev)}
+                            className="min-h-8 px-2 py-1 text-[10px] border border-white/15 rounded text-zinc-200 hover:bg-white/10 transition-colors"
+                          >
+                            Masks {bodyMasksEnabled ? 'On' : 'Off'}
+                          </button>
+                        </div>
+                      </div>
                     </div>
 
                     <div className="grid grid-cols-2 gap-1.5 border border-white/10 rounded p-2">
@@ -2709,7 +3109,7 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
                   </>
                 ) : null}
 
-                <div className="flex-1 min-h-0 overflow-y-auto custom-scrollbar space-y-2 pr-1">
+                <div className="space-y-2 pr-1">
                   {Array.from({ length: timelineSlotsVisible }).map((_, index) => {
                     const slotIndex = clampedTimelineScrollIndex + index;
                     const displayFrame = 1 + slotIndex * timelineStep;
@@ -2722,9 +3122,13 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
                     const hasSegmentControl = hasPose && typeof nextKeyframe === 'number' && nextKeyframe > frame;
                     const segmentSpan = hasSegmentControl ? Math.max(1, nextKeyframe - frame) : 1;
                     const inBetweenCount = hasSegmentControl ? Math.max(0, segmentSpan - 1) : 0;
-                    const segmentKey = hasSegmentControl ? `${frame}->${nextKeyframe}` : '';
-                    const customSegmentDuration = hasSegmentControl ? segmentInterpolationFrames[segmentKey] : undefined;
+                    const segmentPairKey = hasSegmentControl ? segmentIkTweenKey(frame, nextKeyframe as number) : '';
+                    const customSegmentDuration = hasSegmentControl ? segmentInterpolationFrames[segmentPairKey] : undefined;
                     const activeSegmentDuration = customSegmentDuration ?? segmentSpan;
+                    const segmentIkTweenSettings = hasSegmentControl
+                      ? normalizeSegmentIkTweenSettings(segmentIkTweenMap[segmentPairKey])
+                      : DEFAULT_SEGMENT_IK_TWEEN_SETTINGS;
+                    const segmentIkInfluencePct = Math.round(segmentIkTweenSettings.influence * 100);
 
                     return (
                       <div key={`slot-${frame}-${slotIndex}`} className="space-y-1.5 border border-white/10 rounded p-1.5">
@@ -2832,6 +3236,9 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
                                 +
                               </button>
                             </div>
+                            <div className="mt-1.5 text-[10px] tracking-[0.05em] uppercase text-zinc-400">
+                              IK Tween: {segmentIkTweenSettings.enabled ? `On (${segmentIkInfluencePct}%)` : 'Off'}
+                            </div>
                             {timelinePanelMode === 'advanced' ? (
                               <>
                                 <div className="mt-1.5 flex items-center gap-1.5">
@@ -2892,6 +3299,173 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
                                     + Auto Save Tween
                                   </button>
                                 </div>
+                                <div className="mt-1.5 border border-white/10 rounded p-2 space-y-1.5">
+                                  <div className="flex items-center justify-between text-[10px] tracking-[0.05em] uppercase text-zinc-400">
+                                    <span>IK Tween</span>
+                                    <button
+                                      type="button"
+                                      onClick={() => onPatchSegmentIkTween?.(
+                                        frame,
+                                        nextKeyframe as number,
+                                        { enabled: !segmentIkTweenSettings.enabled }
+                                      )}
+                                      disabled={animationControlDisabled || !onPatchSegmentIkTween}
+                                      className="min-h-7 px-2 py-1 text-[10px] border border-white/15 rounded text-zinc-300 hover:bg-white/10 transition-colors disabled:opacity-45 disabled:cursor-not-allowed"
+                                      title="Enable or disable IK-influenced tween preview for this segment"
+                                    >
+                                      {segmentIkTweenSettings.enabled ? 'On' : 'Off'}
+                                    </button>
+                                  </div>
+                                  {segmentIkTweenSettings.enabled ? (
+                                    <>
+                                      <div className="space-y-1">
+                                        <div className="flex items-center justify-between text-[10px] text-zinc-400 tracking-[0.05em] uppercase">
+                                          <span>Influence</span>
+                                          <span>{segmentIkInfluencePct}%</span>
+                                        </div>
+                                        <input
+                                          type="range"
+                                          min={0}
+                                          max={1}
+                                          step={0.05}
+                                          value={segmentIkTweenSettings.influence}
+                                          disabled={animationControlDisabled || !onPatchSegmentIkTween}
+                                          onChange={(event) => {
+                                            const next = Number(event.target.value);
+                                            if (!Number.isFinite(next)) return;
+                                            onPatchSegmentIkTween?.(
+                                              frame,
+                                              nextKeyframe as number,
+                                              { influence: clamp(next, 0, 1) }
+                                            );
+                                          }}
+                                          className="w-full accent-emerald-400 disabled:opacity-45 disabled:cursor-not-allowed"
+                                        />
+                                      </div>
+                                      <div className="grid grid-cols-2 gap-1.5">
+                                        <label className="text-[10px] text-zinc-400 tracking-[0.05em] uppercase flex flex-col gap-1">
+                                          Solver
+                                          <select
+                                            value={segmentIkTweenSettings.solver}
+                                            disabled={animationControlDisabled || !onPatchSegmentIkTween}
+                                            onChange={(event) => onPatchSegmentIkTween?.(
+                                              frame,
+                                              nextKeyframe as number,
+                                              { solver: event.target.value as SegmentIkTweenSettings['solver'] }
+                                            )}
+                                            className="min-h-8 bg-zinc-950/75 border border-zinc-800 rounded px-2 py-1 text-[10px] text-zinc-200 disabled:opacity-45 disabled:cursor-not-allowed"
+                                          >
+                                            <option value="fabrik">FABRIK</option>
+                                            <option value="ccd">CCD</option>
+                                            <option value="hybrid">Hybrid</option>
+                                          </select>
+                                        </label>
+                                        <label className="text-[10px] text-zinc-400 tracking-[0.05em] uppercase flex flex-col gap-1">
+                                          Scope
+                                          <select
+                                            value={segmentIkTweenSettings.solveMode}
+                                            disabled={animationControlDisabled || !onPatchSegmentIkTween}
+                                            onChange={(event) => onPatchSegmentIkTween?.(
+                                              frame,
+                                              nextKeyframe as number,
+                                              { solveMode: event.target.value as SegmentIkTweenSettings['solveMode'] }
+                                            )}
+                                            className="min-h-8 bg-zinc-950/75 border border-zinc-800 rounded px-2 py-1 text-[10px] text-zinc-200 disabled:opacity-45 disabled:cursor-not-allowed"
+                                          >
+                                            <option value="single_chain">Single Chain</option>
+                                            <option value="limbs_only">Limbs Only</option>
+                                            <option value="whole_body_graph">Whole Body</option>
+                                          </select>
+                                        </label>
+                                      </div>
+                                      <div className="grid grid-cols-3 gap-1.5">
+                                        {[
+                                          { key: 'includeHands' as const, label: 'Hands' },
+                                          { key: 'includeFeet' as const, label: 'Feet' },
+                                          { key: 'includeHead' as const, label: 'Head' },
+                                        ].map((option) => (
+                                          <button
+                                            key={option.key}
+                                            type="button"
+                                            onClick={() => onPatchSegmentIkTween?.(
+                                              frame,
+                                              nextKeyframe as number,
+                                              { [option.key]: !segmentIkTweenSettings[option.key] }
+                                            )}
+                                            disabled={animationControlDisabled || !onPatchSegmentIkTween}
+                                            className="min-h-8 px-2 py-1 text-[10px] border rounded transition-colors disabled:opacity-45 disabled:cursor-not-allowed"
+                                            style={{
+                                              borderColor: segmentIkTweenSettings[option.key] ? 'rgba(74, 222, 128, 0.62)' : 'rgba(255, 255, 255, 0.15)',
+                                              background: segmentIkTweenSettings[option.key] ? 'rgba(16, 88, 56, 0.34)' : 'transparent',
+                                              color: segmentIkTweenSettings[option.key] ? 'rgba(236, 253, 245, 0.95)' : 'rgba(212, 212, 216, 0.92)',
+                                            }}
+                                          >
+                                            {option.label}
+                                          </button>
+                                        ))}
+                                      </div>
+                                      <div className="grid grid-cols-3 gap-1.5">
+                                        {[
+                                          { key: 'naturalBendEnabled' as const, label: 'Natural Bend' },
+                                          { key: 'softReachEnabled' as const, label: 'Soft Reach' },
+                                          { key: 'enforceJointLimits' as const, label: 'Joint Limits' },
+                                        ].map((option) => (
+                                          <button
+                                            key={option.key}
+                                            type="button"
+                                            onClick={() => onPatchSegmentIkTween?.(
+                                              frame,
+                                              nextKeyframe as number,
+                                              { [option.key]: !segmentIkTweenSettings[option.key] }
+                                            )}
+                                            disabled={animationControlDisabled || !onPatchSegmentIkTween}
+                                            className="min-h-8 px-2 py-1 text-[10px] border rounded transition-colors disabled:opacity-45 disabled:cursor-not-allowed"
+                                            style={{
+                                              borderColor: segmentIkTweenSettings[option.key] ? 'rgba(74, 222, 128, 0.62)' : 'rgba(255, 255, 255, 0.15)',
+                                              background: segmentIkTweenSettings[option.key] ? 'rgba(16, 88, 56, 0.34)' : 'transparent',
+                                              color: segmentIkTweenSettings[option.key] ? 'rgba(236, 253, 245, 0.95)' : 'rgba(212, 212, 216, 0.92)',
+                                            }}
+                                          >
+                                            {option.label}
+                                          </button>
+                                        ))}
+                                      </div>
+                                      <div className="space-y-1">
+                                        <div className="flex items-center justify-between text-[10px] text-zinc-400 tracking-[0.05em] uppercase">
+                                          <span>Damping</span>
+                                          <span>{segmentIkTweenSettings.damping.toFixed(2)}</span>
+                                        </div>
+                                        <input
+                                          type="range"
+                                          min={0}
+                                          max={0.35}
+                                          step={0.01}
+                                          value={segmentIkTweenSettings.damping}
+                                          disabled={animationControlDisabled || !onPatchSegmentIkTween}
+                                          onChange={(event) => {
+                                            const next = Number(event.target.value);
+                                            if (!Number.isFinite(next)) return;
+                                            onPatchSegmentIkTween?.(
+                                              frame,
+                                              nextKeyframe as number,
+                                              { damping: clamp(next, 0, 0.35) }
+                                            );
+                                          }}
+                                          className="w-full accent-emerald-400 disabled:opacity-45 disabled:cursor-not-allowed"
+                                        />
+                                      </div>
+                                      <button
+                                        type="button"
+                                        onClick={() => onPatchSegmentIkTween?.(frame, nextKeyframe as number, null)}
+                                        disabled={animationControlDisabled || !onPatchSegmentIkTween}
+                                        className="w-full min-h-8 px-2 py-1 text-[10px] border border-white/15 rounded text-zinc-300 hover:bg-white/10 transition-colors disabled:opacity-45 disabled:cursor-not-allowed"
+                                        title="Remove this segment override and revert to default IK tween off"
+                                      >
+                                        Reset IK Tween
+                                      </button>
+                                    </>
+                                  ) : null}
+                                </div>
                               </>
                             ) : (
                               <button
@@ -2951,6 +3525,253 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
         </div>
       ) : null}
 
+      {gridOnlyMode && activeMaskEditorJointId !== null ? (
+        <div
+          className="absolute pointer-events-auto"
+          style={{
+            top: '0px',
+            bottom: '0px',
+            right: '0px',
+            zIndex: 73,
+          }}
+        >
+          <div
+            className="border rounded-none shadow-xl backdrop-blur-sm h-full flex flex-col"
+            style={{
+              width: `${timelineRailWidth}px`,
+              height: '100%',
+              background: CONSOLE_PANEL_BACKGROUND,
+              borderColor: 'rgba(158, 150, 184, 0.5)',
+            }}
+          >
+            <div className="px-3 py-2.5 border-b border-violet-200/20 flex items-center justify-between gap-1.5">
+              <span className="text-[10px] tracking-[0.16em] uppercase text-violet-100/90 font-semibold">Mask Editor</span>
+              <button
+                type="button"
+                onClick={() => setActiveMaskEditorJointId(null)}
+                className="min-h-7 px-2 py-1 text-[10px] border border-white/15 rounded text-zinc-100 hover:bg-white/10 transition-colors"
+                title="Return to animation console"
+              >
+                Back To Timeline
+              </button>
+            </div>
+
+            <div className="px-2.5 py-2.5 flex-1 min-h-0 overflow-y-auto custom-scrollbar flex flex-col gap-2.5">
+              <div className="space-y-1.5 border border-white/10 rounded p-2">
+                <div className="flex items-center justify-between text-[10px] tracking-[0.05em] uppercase text-zinc-300">
+                  <span>{activeMaskEditorJointLabel}</span>
+                  <span className="text-zinc-500">{activeMaskEditorLayer.src ? 'Loaded' : 'Empty'}</span>
+                </div>
+                <div className="grid grid-cols-2 gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => openBodyPartMaskUpload(activeMaskEditorJointId, true)}
+                    disabled={!onUploadBodyPartMaskLayer}
+                    className="min-h-8 px-2 py-1 text-[10px] border border-white/15 rounded text-zinc-200 hover:bg-white/10 transition-colors disabled:opacity-45 disabled:cursor-not-allowed"
+                  >
+                    {activeMaskEditorLayer.src ? 'Replace Mask' : 'Upload Mask'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onClearBodyPartMaskLayer?.(activeMaskEditorJointId);
+                    }}
+                    disabled={!onClearBodyPartMaskLayer || !activeMaskEditorLayer.src}
+                    className="min-h-8 px-2 py-1 text-[10px] border border-white/15 rounded text-zinc-200 hover:bg-white/10 transition-colors disabled:opacity-45 disabled:cursor-not-allowed"
+                  >
+                    Clear Mask
+                  </button>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => patchActiveMaskEditor({
+                    ...DEFAULT_BODY_PART_MASK_LAYER,
+                    src: activeMaskEditorLayer.src,
+                    visible: activeMaskEditorLayer.src ? true : activeMaskEditorLayer.visible,
+                  })}
+                  disabled={!onPatchBodyPartMaskLayer}
+                  className="w-full min-h-8 px-2 py-1 text-[10px] border border-white/15 rounded text-zinc-200 hover:bg-white/10 transition-colors disabled:opacity-45 disabled:cursor-not-allowed"
+                >
+                  Reset Transform
+                </button>
+              </div>
+
+              <label className="flex items-center justify-between text-[10px] tracking-[0.05em] uppercase text-zinc-300 border border-white/10 rounded p-2">
+                <span>Visible</span>
+                <input
+                  type="checkbox"
+                  checked={activeMaskEditorLayer.visible}
+                  disabled={!activeMaskEditorLayer.src || !onPatchBodyPartMaskLayer}
+                  onChange={(event) => patchActiveMaskEditor({ visible: event.target.checked })}
+                  className="h-3.5 w-3.5 accent-violet-400 disabled:opacity-45"
+                />
+              </label>
+
+              <div className="space-y-1.5 border border-white/10 rounded p-2">
+                <label className="block space-y-1">
+                  <span className="text-[9px] tracking-[0.05em] uppercase text-zinc-400">Mode</span>
+                  <select
+                    value={activeMaskMode}
+                    disabled={!onPatchBodyPartMaskLayer}
+                    onChange={(event) =>
+                      patchActiveMaskEditor({
+                        mode: event.target.value as NonNullable<BodyPartMaskLayer['mode']>,
+                      })
+                    }
+                    className="w-full min-h-8 bg-zinc-950/75 border border-zinc-800 rounded px-2 py-1 text-[10px] text-zinc-200 disabled:opacity-45 disabled:cursor-not-allowed"
+                  >
+                    {BODY_PART_MASK_MODE_OPTIONS.map((option) => (
+                      <option key={`editor-mask-mode-${option.value}`} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                <label className="block space-y-1">
+                  <span className="text-[9px] tracking-[0.05em] uppercase text-zinc-400">Blend</span>
+                  <select
+                    value={activeMaskBlendMode}
+                    disabled={!onPatchBodyPartMaskLayer}
+                    onChange={(event) => patchActiveMaskEditor({ blendMode: event.target.value as GlobalCompositeOperation })}
+                    className="w-full min-h-8 bg-zinc-950/75 border border-zinc-800 rounded px-2 py-1 text-[10px] text-zinc-200 disabled:opacity-45 disabled:cursor-not-allowed"
+                  >
+                    {FOREGROUND_BLEND_OPTIONS.map((option) => (
+                      <option key={`editor-mask-blend-${option.value}`} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                <label className="block space-y-1">
+                  <span className="text-[9px] tracking-[0.05em] uppercase text-zinc-400">Filter Preset</span>
+                  <select
+                    value={BODY_PART_MASK_FILTER_OPTIONS.some((option) => option.value === activeMaskFilter) ? activeMaskFilter : 'none'}
+                    disabled={!onPatchBodyPartMaskLayer}
+                    onChange={(event) => patchActiveMaskEditor({ filter: event.target.value })}
+                    className="w-full min-h-8 bg-zinc-950/75 border border-zinc-800 rounded px-2 py-1 text-[10px] text-zinc-200 disabled:opacity-45 disabled:cursor-not-allowed"
+                  >
+                    {BODY_PART_MASK_FILTER_OPTIONS.map((option) => (
+                      <option key={`editor-mask-filter-${option.value}`} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                <label className="block space-y-1">
+                  <span className="text-[9px] tracking-[0.05em] uppercase text-zinc-400">Filter (Custom)</span>
+                  <input
+                    type="text"
+                    value={activeMaskFilter}
+                    disabled={!onPatchBodyPartMaskLayer}
+                    onChange={(event) => patchActiveMaskEditor({ filter: event.target.value || 'none' })}
+                    className="w-full min-h-8 bg-zinc-950/75 border border-zinc-800 rounded px-2 py-1 text-[10px] text-zinc-300 disabled:opacity-45 disabled:cursor-not-allowed"
+                    placeholder="none"
+                  />
+                </label>
+              </div>
+
+	              <div className="grid grid-cols-2 gap-1.5 border border-white/10 rounded p-2">
+	                <label className="space-y-1">
+	                  <span className="text-[9px] tracking-[0.05em] uppercase text-zinc-400">Opacity</span>
+	                  <input
+                    type="number"
+                    min={0}
+                    max={100}
+                    value={activeMaskOpacityPercent}
+                    disabled={!onPatchBodyPartMaskLayer}
+                    onChange={(event) => patchActiveMaskEditor({ opacity: clamp(Number(event.target.value), 0, 100) / 100 })}
+                    className="w-full min-h-8 bg-zinc-950/75 border border-zinc-800 rounded px-2 py-1 text-[10px] text-zinc-300 disabled:opacity-45 disabled:cursor-not-allowed"
+                  />
+                </label>
+	                <label className="space-y-1">
+	                  <span className="text-[9px] tracking-[0.05em] uppercase text-zinc-400">Scale</span>
+	                  <input
+	                    type="number"
+	                    min={BODY_PART_MASK_SCALE_MIN}
+	                    max={400}
+	                    value={activeMaskScalePercent}
+	                    disabled={!onPatchBodyPartMaskLayer}
+	                    onChange={(event) => patchActiveMaskEditor({
+	                      scale: clamp(Number(event.target.value), BODY_PART_MASK_SCALE_MIN, 400),
+	                    })}
+	                    className="w-full min-h-8 bg-zinc-950/75 border border-zinc-800 rounded px-2 py-1 text-[10px] text-zinc-300 disabled:opacity-45 disabled:cursor-not-allowed"
+	                  />
+	                </label>
+                <label className="space-y-1">
+                  <span className="text-[9px] tracking-[0.05em] uppercase text-zinc-400">Rotate</span>
+                  <input
+                    type="number"
+                    min={-180}
+                    max={180}
+                    value={activeMaskRotation}
+                    disabled={!onPatchBodyPartMaskLayer}
+	                    onChange={(event) => patchActiveMaskEditor({ rotationDeg: clamp(Number(event.target.value), -180, 180) })}
+	                    className="w-full min-h-8 bg-zinc-950/75 border border-zinc-800 rounded px-2 py-1 text-[10px] text-zinc-300 disabled:opacity-45 disabled:cursor-not-allowed"
+	                  />
+	                </label>
+	                <div className="col-span-2 grid grid-cols-2 gap-1.5">
+	                  <div className="space-y-1.5">
+	                    <label className="space-y-1">
+	                      <span className="text-[9px] tracking-[0.05em] uppercase text-zinc-400">Skew X</span>
+	                      <input
+	                        type="number"
+	                        min={-80}
+	                        max={80}
+	                        value={activeMaskSkewX}
+	                        disabled={!onPatchBodyPartMaskLayer}
+	                        onChange={(event) => patchActiveMaskEditor({ skewXDeg: clamp(Number(event.target.value), -80, 80) })}
+	                        className="w-full min-h-8 bg-zinc-950/75 border border-zinc-800 rounded px-2 py-1 text-[10px] text-zinc-300 disabled:opacity-45 disabled:cursor-not-allowed"
+	                      />
+	                    </label>
+	                    <label className="space-y-1">
+	                      <span className="text-[9px] tracking-[0.05em] uppercase text-zinc-400">Offset X</span>
+	                      <input
+	                        type="number"
+	                        min={-300}
+	                        max={300}
+	                        value={activeMaskOffsetX}
+	                        disabled={!onPatchBodyPartMaskLayer}
+	                        onChange={(event) => patchActiveMaskEditor({ offsetX: clamp(Number(event.target.value), -300, 300) })}
+	                        className="w-full min-h-8 bg-zinc-950/75 border border-zinc-800 rounded px-2 py-1 text-[10px] text-zinc-300 disabled:opacity-45 disabled:cursor-not-allowed"
+	                      />
+	                    </label>
+	                  </div>
+	                  <div className="space-y-1.5">
+	                    <label className="space-y-1">
+	                      <span className="text-[9px] tracking-[0.05em] uppercase text-zinc-400">Skew Y</span>
+	                      <input
+	                        type="number"
+	                        min={-80}
+	                        max={80}
+	                        value={activeMaskSkewY}
+	                        disabled={!onPatchBodyPartMaskLayer}
+	                        onChange={(event) => patchActiveMaskEditor({ skewYDeg: clamp(Number(event.target.value), -80, 80) })}
+	                        className="w-full min-h-8 bg-zinc-950/75 border border-zinc-800 rounded px-2 py-1 text-[10px] text-zinc-300 disabled:opacity-45 disabled:cursor-not-allowed"
+	                      />
+	                    </label>
+	                    <label className="space-y-1">
+	                      <span className="text-[9px] tracking-[0.05em] uppercase text-zinc-400">Offset Y</span>
+	                      <input
+	                        type="number"
+	                        min={-300}
+	                        max={300}
+	                        value={activeMaskOffsetY}
+	                        disabled={!onPatchBodyPartMaskLayer}
+	                        onChange={(event) => patchActiveMaskEditor({ offsetY: clamp(Number(event.target.value), -300, 300) })}
+	                        className="w-full min-h-8 bg-zinc-950/75 border border-zinc-800 rounded px-2 py-1 text-[10px] text-zinc-300 disabled:opacity-45 disabled:cursor-not-allowed"
+	                      />
+	                    </label>
+	                  </div>
+	                </div>
+	              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
       {gridOnlyMode && onExitGridView ? (
         <button
           type="button"
@@ -2966,7 +3787,7 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
         </button>
       ) : null}
 
-      {gridOnlyMode && (onMovementTogglesChange || onInteractionModeChange || onToggleLotteMode) ? (
+      {gridOnlyMode && (onMovementTogglesChange || onInteractionModeChange || onToggleLotteMode || onUndo || onRedo || onReturnDefaultPose) ? (
         <>
           <div
             className="absolute flex items-center gap-2"
@@ -2999,22 +3820,56 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
                 onClick={() =>
                   onMovementTogglesChange({
                     ...(movementToggles || {}),
-                    fkConstraintsEnabled: (movementToggles?.fkConstraintsEnabled ?? true) ? false : true,
+                    fkConstraintsEnabled: (movementToggles?.fkConstraintsEnabled ?? false) ? false : true,
                   })
                 }
                 className="min-h-9 px-3 py-2 text-[11px] tracking-[0.1em] font-semibold uppercase rounded transition-colors"
                 style={{
-                  background: (movementToggles?.fkConstraintsEnabled ?? true)
+                  background: (movementToggles?.fkConstraintsEnabled ?? false)
                     ? 'rgba(16, 88, 56, 0.34)'
                     : 'rgba(88, 82, 108, 0.28)',
-                  border: (movementToggles?.fkConstraintsEnabled ?? true)
+                  border: (movementToggles?.fkConstraintsEnabled ?? false)
                     ? '1px solid rgba(74, 222, 128, 0.62)'
                     : '1px solid rgba(158, 150, 184, 0.62)',
                   color: 'rgba(232, 228, 243, 0.95)',
                 }}
                 title="Toggle FK joint angle constraints"
               >
-                Joint Limits {(movementToggles?.fkConstraintsEnabled ?? true) ? 'On' : 'Off'}
+                Joint Limits {(movementToggles?.fkConstraintsEnabled ?? false) ? 'On' : 'Off'}
+              </button>
+            ) : null}
+
+            {onUndo ? (
+              <button
+                type="button"
+                onClick={onUndo}
+                disabled={!canUndo}
+                className="min-h-9 px-3 py-2 text-[11px] tracking-[0.1em] font-semibold uppercase rounded transition-colors disabled:opacity-45 disabled:cursor-not-allowed"
+                style={{
+                  background: canUndo ? 'rgba(16, 88, 56, 0.34)' : 'rgba(88, 82, 108, 0.2)',
+                  border: canUndo ? '1px solid rgba(74, 222, 128, 0.62)' : '1px solid rgba(158, 150, 184, 0.4)',
+                  color: canUndo ? 'rgba(232, 245, 236, 0.95)' : 'rgba(170, 168, 181, 0.85)',
+                }}
+                title="Undo pose and timeline edits"
+              >
+                Undo
+              </button>
+            ) : null}
+
+            {onRedo ? (
+              <button
+                type="button"
+                onClick={onRedo}
+                disabled={!canRedo}
+                className="min-h-9 px-3 py-2 text-[11px] tracking-[0.1em] font-semibold uppercase rounded transition-colors disabled:opacity-45 disabled:cursor-not-allowed"
+                style={{
+                  background: canRedo ? 'rgba(16, 88, 56, 0.34)' : 'rgba(88, 82, 108, 0.2)',
+                  border: canRedo ? '1px solid rgba(74, 222, 128, 0.62)' : '1px solid rgba(158, 150, 184, 0.4)',
+                  color: canRedo ? 'rgba(232, 245, 236, 0.95)' : 'rgba(170, 168, 181, 0.85)',
+                }}
+                title="Redo pose and timeline edits"
+              >
+                Redo
               </button>
             ) : null}
 
@@ -3064,7 +3919,129 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
               Timeline Panel {showAnimationTimeline ? 'On' : 'Off'}
             </button>
 
+            <button
+              type="button"
+              onClick={() =>
+                setBodyMasksEnabled((prev) => {
+                  const next = !prev;
+                  if (!next) {
+                    setActiveMaskEditorJointId(null);
+                  }
+                  return next;
+                })
+              }
+              className="min-h-9 px-3 py-2 text-[11px] tracking-[0.1em] font-semibold uppercase rounded transition-colors"
+              style={{
+                background: bodyMasksEnabled ? 'rgba(16, 88, 56, 0.34)' : 'rgba(88, 82, 108, 0.28)',
+                border: bodyMasksEnabled ? '1px solid rgba(74, 222, 128, 0.62)' : '1px solid rgba(158, 150, 184, 0.62)',
+                color: 'rgba(232, 228, 243, 0.95)',
+              }}
+              title={`Toggle body-part masks (${loadedBodyMaskCount} loaded)`}
+            >
+              Masks {bodyMasksEnabled ? 'On' : 'Off'}
+            </button>
+
           </div>
+
+          {onReturnDefaultPose ? (
+            <button
+              type="button"
+              onClick={onReturnDefaultPose}
+              className="absolute h-9 pl-1.5 pr-2.5 border rounded flex items-center gap-2 transition-colors hover:bg-white/10"
+              style={{
+                top: `${gridRefineTop}px`,
+                right: `${rightRailOffset}px`,
+                zIndex: 73,
+                background: CONSOLE_PANEL_BACKGROUND,
+                borderColor: 'rgba(158, 150, 184, 0.62)',
+                color: 'rgba(232, 228, 243, 0.96)',
+              }}
+              title="Return to default pose"
+            >
+              <svg viewBox="0 0 100 100" className="w-7 h-7 rounded bg-zinc-950/45 p-[1px]">
+                <path d={defaultPoseThumb.path} stroke="rgba(226, 232, 240, 0.92)" strokeWidth="3.2" fill="none" strokeLinecap="round" />
+                {defaultPoseThumb.joints.map((jointPoint, jointIndex) => (
+                  <circle
+                    key={`default-joint-${jointIndex}`}
+                    cx={jointPoint.x}
+                    cy={jointPoint.y}
+                    r="1.7"
+                    fill="rgba(196, 181, 253, 0.95)"
+                  />
+                ))}
+              </svg>
+              <span className="text-[10px] tracking-[0.08em] uppercase font-semibold">Default</span>
+            </button>
+          ) : null}
+
+          {poseLibraryFrame !== null && onApplyPoseToFrame ? (
+            <div
+              className="absolute border rounded shadow-xl backdrop-blur-sm flex flex-col"
+              style={{
+                top: `${gridRefineTop + 44}px`,
+                right: `${rightRailOffset}px`,
+                zIndex: 74,
+                width: '268px',
+                maxHeight: `${Math.max(220, height - (gridRefineTop + 96))}px`,
+                background: CONSOLE_PANEL_BACKGROUND,
+                borderColor: 'rgba(158, 150, 184, 0.5)',
+              }}
+            >
+              <div className="px-3 py-2 border-b border-violet-200/20 flex items-center justify-between gap-2">
+                <div className="flex flex-col">
+                  <span className="text-[10px] tracking-[0.16em] uppercase text-violet-100/90 font-semibold">Pose Library</span>
+                  <span className="text-[10px] text-zinc-400">Frame {poseLibraryDisplayFrame}</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPoseLibraryFrame(null);
+                    setPoseLibrarySearch('');
+                  }}
+                  className="min-h-7 px-2 py-1 text-[10px] border border-white/15 rounded text-zinc-200 hover:bg-white/10 transition-colors"
+                  title="Close pose library"
+                >
+                  Close
+                </button>
+              </div>
+
+              <div className="px-2.5 pt-2.5 pb-2 border-b border-white/10">
+                <input
+                  type="text"
+                  value={poseLibrarySearch}
+                  onChange={(event) => setPoseLibrarySearch(event.target.value)}
+                  placeholder="Search poses..."
+                  className="w-full min-h-8 bg-zinc-950/75 border border-zinc-800 rounded px-2 py-1.5 text-[11px] text-zinc-200 placeholder:text-zinc-500"
+                />
+              </div>
+
+              <div className="flex-1 min-h-0 overflow-y-auto custom-scrollbar px-2.5 py-2.5 space-y-1.5">
+                {filteredPoseLibraryNames.length ? (
+                  filteredPoseLibraryNames.map((poseName) => (
+                    <button
+                      key={`pose-library-${poseName}`}
+                      type="button"
+                      onClick={() => handleApplyPoseFromLibrary(poseName)}
+                      className="w-full min-h-8 px-2.5 py-1.5 text-left border rounded transition-colors flex items-center justify-between gap-2 hover:bg-white/10"
+                      style={{
+                        borderColor: 'rgba(255, 255, 255, 0.12)',
+                        color: 'rgba(228, 228, 235, 0.94)',
+                        background: 'rgba(33, 37, 52, 0.38)',
+                      }}
+                      title={`Apply ${poseName} to frame ${poseLibraryDisplayFrame}`}
+                    >
+                      <span className="text-[11px] tracking-[0.04em]">{poseName}</span>
+                      <span className="text-[10px] tracking-[0.06em] uppercase text-zinc-400">Apply</span>
+                    </button>
+                  ))
+                ) : (
+                  <div className="px-1 py-2 text-[10px] tracking-[0.04em] text-zinc-400">
+                    No poses match “{poseLibrarySearch.trim()}”.
+                  </div>
+                )}
+              </div>
+            </div>
+          ) : null}
 
           {showRefineMenu && onMovementTogglesChange ? (
             <div
@@ -3074,7 +4051,7 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
                 left: `${UI_INSET}px`,
                 zIndex: 73,
                 width: '320px',
-                background: 'rgba(18, 16, 24, 0.74)',
+                background: CONSOLE_PANEL_BACKGROUND,
                 borderColor: 'rgba(158, 150, 184, 0.5)',
               }}
             >
@@ -3114,6 +4091,42 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
                         className="w-full accent-violet-400"
                       />
                     </label>
+                    <div className="grid grid-cols-2 gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          onMovementTogglesChange({
+                            ...(movementToggles || {}),
+                            fkBendEnabled: !fkBendEnabled,
+                          })
+                        }
+                        className={`min-h-8 px-2.5 py-1.5 text-[10px] tracking-[0.06em] uppercase border rounded transition-colors ${
+                          fkBendEnabled
+                            ? 'text-emerald-100 border-emerald-300/70 bg-emerald-500/20'
+                            : 'text-zinc-400 border-white/10 hover:bg-white/10'
+                        }`}
+                        title="Enable FK bend propagation logic"
+                      >
+                        Bend {fkBendEnabled ? 'On' : 'Off'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          onMovementTogglesChange({
+                            ...(movementToggles || {}),
+                            fkStretchEnabled: !fkStretchEnabled,
+                          })
+                        }
+                        className={`min-h-8 px-2.5 py-1.5 text-[10px] tracking-[0.06em] uppercase border rounded transition-colors ${
+                          fkStretchEnabled
+                            ? 'text-emerald-100 border-emerald-300/70 bg-emerald-500/20'
+                            : 'text-zinc-400 border-white/10 hover:bg-white/10'
+                        }`}
+                        title="Enable FK stretch propagation logic"
+                      >
+                        Stretch {fkStretchEnabled ? 'On' : 'Off'}
+                      </button>
+                    </div>
                     <label className="block">
                       <div className="text-[10px] tracking-[0.08em] uppercase text-zinc-200 mb-1 flex items-center justify-between">
                         <span>Root X</span>
@@ -3229,7 +4242,7 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
                         const label = bitruviusData.JOINT_DEFS[jointId]?.label ?? jointId;
                         const min = -180;
                         const max = 180;
-                        const value = normA(rotationsRef.current[jointId] ?? bitruviusData.initialRotations[jointId] ?? 0);
+                        const value = normA(rotationsRef.current[jointId] ?? currentRotations[jointId] ?? 0);
                         const bendOffset = clamp(Math.round(fkBendOffsetByJoint[jointId] ?? 0), -12, 12);
                         const stretchOffset = clamp(Math.round(fkStretchOffsetByJoint[jointId] ?? 0), -12, 12);
                         return (

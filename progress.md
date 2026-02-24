@@ -484,3 +484,292 @@ Original prompt: add the model to the grid.The head piece should fit exactly in 
 - Validation:
   - `npm test -- --run` passes (16/16).
   - `npm run build` passes.
+
+- System audit (top-to-bottom) run completed.
+- Health checks:
+  - `npm test` passed: 3 files, 16 tests.
+  - `npm run build` passed.
+  - `npm run lint` failed: 356 problems total (333 errors, 23 warnings).
+  - Lint breakdown by area (machine-parsed):
+    - `Bitruvius-Core-Motion`: 320 errors, 16 warnings
+    - active app surface (`App.tsx`, `components`, `renderer.ts`, `ikSolver.ts`): 13 errors, 7 warnings
+- Runtime smoke (develop-web-game Playwright client):
+  - Initial run blocked by sandbox browser launch permissions.
+  - Escalated run succeeded and captured screenshot:
+    - `output/web-game/system-audit-2026-02-24/shot-0.png`
+  - No `errors-*.json` generated.
+  - No `state-*.json` generated because `window.render_game_to_text` is not exposed by current active app.
+
+## TODO / Suggestions For Next Agent
+- Security/portability:
+  - Remove frontend injection of `GEMINI_API_KEY` via Vite `define`.
+  - Replace hardcoded external alias (`../FrankenBitruvius/...`) with local package/workspace dependency strategy.
+- Lint posture:
+  - Decide whether `Bitruvius-Core-Motion` should be linted in this repo. If not, add explicit ignore(s); if yes, schedule debt reduction.
+- Active app lint blockers (small targeted fixes):
+  - `App.tsx`: recursive `animate` callback lint violation + unused `majorGridSize`.
+  - `components/CanvasGrid.tsx`: ref read during render (`rotationsRef.current`) in advanced FK slider map + stale unused FK constants.
+  - `renderer.ts` and `ikSolver.ts`: remove/resolve unused assignments.
+- Testability:
+  - Add `window.render_game_to_text` and `window.advanceTime(ms)` bridge in the active app to unlock deterministic runtime assertions in Playwright audits.
+- Repo hygiene:
+  - Investigate/remove tracked placeholder binary files `[full_path_of_file_1]` and `[full_path_of_file_2]`.
+- Implemented shared FK runtime module `fkEngine.ts`:
+  - Added reusable FK world-transform functions (`computeJointWorldForPose`, `computeWorldPoseForSkeleton`).
+  - Added FK animation utilities:
+    - keyframe sampling with shortest-angle interpolation + loop support (`sampleFkAnimation`),
+    - procedural FK overlay presets (`idle_breath`, `walk_cycle`) with per-joint limit clamping (`applyFkAnimationOverlay`).
+- Integrated FK engine into active runtime:
+  - `components/CanvasGrid.tsx` now imports/uses shared FK world transform helper instead of local duplicated implementation.
+  - Added FK animation controls in FK Refine panel:
+    - `FK Anim On/Off`
+    - preset selector (`Idle Breath`, `Walk Cycle`)
+    - intensity slider
+    - speed slider
+- App-level animation/runtime wiring in `App.tsx`:
+  - Added FK animation movement toggles defaults/state plumbing (`fkAnimationEnabled`, `fkAnimationPreset`, `fkAnimationIntensity`, `fkAnimationSpeed`).
+  - During playback preview, sampled timeline pose is optionally layered through `applyFkAnimationOverlay` when FK animation is enabled.
+  - Added deterministic runtime bridges for automated testing:
+    - `window.render_game_to_text` now returns concise JSON state including FK animation status + joint world coordinates.
+    - `window.advanceTime(ms)` now advances timeline frames deterministically over the current playback keyframe range.
+- Added unit coverage in new `fkEngine.test.ts`:
+  - FK world transform consistency,
+  - full world-map generation,
+  - shortest-angle keyframe interpolation,
+  - looped keyframe frame-wrap sampling,
+  - FK animation overlay joint-limit clamping.
+- Validation:
+  - `npm test` passes (4 files, 21 tests).
+  - `npm run build` passes.
+  - Playwright skill-client run (escalated for Chromium launch) against local app succeeded:
+    - screenshot: `output/web-game/fk-engine-animation-2026-02-24/shot-0.png`
+    - text state: `output/web-game/fk-engine-animation-2026-02-24/state-0.json`
+    - no `errors-*.json` artifact emitted.
+- FK trim-back pass per latest request (pure FK focus):
+  - Removed FK animation overlay runtime and controls from active app surface.
+    - `App.tsx` playback preview now samples timeline pose directly (no procedural FK overlay stage).
+    - `components/CanvasGrid.tsx` FK refine panel no longer shows FK animation preset/intensity/speed controls.
+  - Added explicit FK logic toggles for bend/stretch propagation, each independent and default OFF:
+    - new movement toggles: `fkBendEnabled`, `fkStretchEnabled`.
+    - FK drag solve path now applies bend offsets only when `fkBendEnabled` is true, and stretch offsets only when `fkStretchEnabled` is true.
+    - defaults wired in app state/effective toggles so both are false at startup.
+  - Updated test text-state payload to expose pure-FK assist flags:
+    - `fkAssist: { bendEnabled, stretchEnabled }`.
+- Validation:
+  - `npm test` passes (4 files, 21 tests).
+  - `npm run build` passes.
+  - Playwright skill-client verification (escalated Chromium launch) succeeded:
+    - screenshot: `output/web-game/fk-pure-bend-stretch-2026-02-24/shot-0.png`
+    - text state: `output/web-game/fk-pure-bend-stretch-2026-02-24/state-0.json`
+    - state confirms `fkAssist.bendEnabled=false` and `fkAssist.stretchEnabled=false` by default.
+    - no `errors-*.json` artifact emitted.
+- FK live-redraw regression fix:
+  - Root cause: canvas render effect in `components/CanvasGrid.tsx` was not dependent on `currentRotations`, so FK drag updates mutated state but draw pass did not re-run continuously.
+  - Fix: added `currentRotations` to the render effect dependency list so FK visual updates render during drag (not only on release).
+- Validation:
+  - `npm test` passes (4 files, 21 tests).
+  - `npm run build` passes.
+  - Playwright verification (escalated Chromium launch) succeeded:
+    - `output/web-game/fk-live-redraw-fix-2026-02-24/shot-0.png`
+    - `output/web-game/fk-live-redraw-fix-2026-02-24/state-0.json`
+    - no `errors-*.json` artifact emitted.
+- FK live posing + constraints-default update:
+  - `App.tsx`
+    - Set FK constraints default to OFF in movement defaults (`fkConstraintsEnabled: false`).
+    - Effective FK constraints now default false unless explicitly enabled (`movementToggles.fkConstraintsEnabled === true`).
+    - Increased real-time keyframe/version refresh cadence during FK drag from 120ms to 16ms so FK animation/timeline feedback updates feel live while posing.
+  - `components/CanvasGrid.tsx`
+    - Set FK constraints default fallback to OFF (`fkConstraintsEnabled = false`).
+    - Enabled live FK posing while playback is active by allowing mouse-move FK/ROOT drag updates during play; non-FK interactions still cancel while playing.
+    - Updated Joint Limits UI toggle fallback/default state to OFF (`?? false`), including button visuals and label text.
+- Validation:
+  - `npm test` passes (4 files, 21 tests).
+  - `npm run build` passes.
+  - Playwright skill-client run (escalated Chromium launch) succeeded:
+    - screenshot: `output/web-game/fk-live-pose-constraints-off-2026-02-24/shot-0.png`
+    - state: `output/web-game/fk-live-pose-constraints-off-2026-02-24/state-0.json`
+    - no `errors-*.json` artifact emitted.
+
+- Simplified grid/ring/model coupling to a single live runtime geometry contract (root app only; no timeline save-flow changes):
+  - Added new adapter API in `adapters/vitruvianGrid.ts`:
+    - `VitruvianViewportInput`
+    - `VitruvianRuntimeGeometry`
+    - `createVitruvianRuntimeGeometry(...)`
+    - shared `HEAD_PIECE_MODEL_BOUNDS`
+    - unified helpers for world/screen projection, model projection, and head-grid cell resolution.
+  - Refactored `components/CanvasGrid.tsx`:
+    - removed duplicated local `gridProjection` + `headGridHoverMetrics` pipelines,
+    - now derives both interaction mapping (`toDisplayPoint`/`fromDisplayPoint`) and head-grid hover mapping from one `runtimeGeometry` memo,
+    - timeline square sizing now uses `runtimeGeometry.headGridSquarePx`,
+    - passes `runtimeGeometry` into renderer.
+  - Refactored `renderer.ts`:
+    - `RenderOptions` now accepts optional `runtimeGeometry`,
+    - render path now consumes shared runtime geometry for grid/rings/model projection math,
+    - fallback runtime geometry creation is centralized through adapter helper when not provided.
+  - Simplified visual module profile coupling in `App.tsx`:
+    - removed dual-profile constants/state (`3000/3001`) and replaced with a single runtime `visualModules` source,
+    - standardized state string now emits a single `vm:` token while legacy tokens remain safely ignored by parser.
+  - Added adapter invariants tests in `adapters/vitruvianGrid.runtime.test.ts`:
+    - world->screen->world round-trip tolerance,
+    - grid-only baseline anchoring for projected reference heel,
+    - head-grid square + ring-step consistency checks.
+- Validation after refactor:
+  - `npm test -- --run` passes (5 files, 24 tests).
+  - `npm run build` passes.
+  - Playwright smoke (escalated Chromium launch) succeeded against `http://localhost:3000`:
+    - screenshot: `output/web-game/runtime-geometry-coupling-2026-02-24/shot-0.png`
+    - state: `output/web-game/runtime-geometry-coupling-2026-02-24/state-0.json`
+- FK default-fluidity stabilization pass (flicker cleanup):
+  - `components/CanvasGrid.tsx`: reworked FK drag update to use event-time smoothing against a persisted per-joint target rotation (`fkTargetRotationRef`) instead of directly applying raw per-event deltas.
+  - Added FK jitter guards + stability clamps:
+    - pointer-noise delta epsilon (`FK_ROTATION_NOISE_EPSILON_DEG`),
+    - visual-apply epsilon (`FK_ROTATION_APPLY_EPSILON_DEG`) to skip micro no-op updates,
+    - per-frame max angular step cap (`FK_ROTATION_STEP_MAX`) scaled by event `dt`.
+  - Added FK drag lifecycle refs/cleanup (`fkLastEventTsRef`, `fkTargetRotationRef`) and explicit cleanup on mouse up/leave.
+  - Added `rootRotateRef` synchronization so root FK drag does not rely on potentially stale toggle props during rapid input.
+- Default FK responsiveness tuning:
+  - `App.tsx` default movement toggles now start with `fkRotationSensitivity: 1` and `fkRotationResponse: 1` for fluid baseline behavior.
+  - `CanvasGrid` fallback defaults for those values also set to `1`.
+- Validation after FK fluidity fix:
+  - `npm run test -- --run` passes (4 files, 21 tests).
+  - `npm run build` passes.
+  - Playwright skill-client verification (escalated Chromium launch) succeeded:
+    - screenshot: `output/web-game/fk-default-fluidity-fix-2026-02-24/shot-0.png`
+    - state: `output/web-game/fk-default-fluidity-fix-2026-02-24/state-0.json`
+    - no `errors-*.json` artifact emitted.
+- Added per-body-part mask upload pipeline with mode controls (`projection` / `costume`) for all renderable body pieces.
+  - `renderer.ts`:
+    - Added `BodyPartMaskLayer` + `BodyPartMaskMode` and new `RenderOptions.bodyPartMasks`.
+    - Added reusable shape-path helper to keep mask clipping aligned to part silhouettes.
+    - Added per-part mask draw pass centered on each part's **parent anchor** (fallback to own joint for root-like cases).
+    - `projection` mode now clips mask image to the piece silhouette.
+    - `costume` mode now overlays full mask image on the piece transform without clipping.
+  - `App.tsx`:
+    - Added `bodyPartMaskLayers` state + blob URL lifecycle management per joint.
+    - Added callbacks for upload/clear/patch per body part and wired into `CanvasGrid` props.
+  - `components/CanvasGrid.tsx`:
+    - Added props + hidden upload input for body-part mask files.
+    - Added advanced timeline panel UI section `Body Masks` listing all renderable parts with per-part Upload/Clear, mode selector, visibility toggle, opacity, and scale controls.
+    - Passed `bodyPartMasks` into renderer call.
+- Added animated wheel scrolling for the **entire** timeline console surface (not slot list only):
+  - timeline controls container is now the single scroll surface (`overflow-y-auto`) with smooth scroll animation driven by RAF.
+  - removed nested slot-only scroll container to avoid scroll-trap behavior.
+  - maintained manual timeline slot scroll controls/buttons.
+- Validation:
+  - `npm run build` passes.
+  - `npm test -- --run` passes (6 files / 31 tests).
+  - Playwright skill client run (local `.mjs` execution) generated canvas artifacts:
+    - `output/web-game/body-mask-console-scroll-2026-02-24/shot-0.png`
+    - `output/web-game/body-mask-console-scroll-2026-02-24/shot-1.png`
+    - `output/web-game/body-mask-console-scroll-2026-02-24/shot-2.png`
+  - Direct Playwright DOM verification on fresh Vite port confirmed whole-console scroll movement:
+    - before/after scrollTop `0 -> 772`
+    - evidence: `output/web-game/body-mask-console-scroll-2026-02-24/console-scroll-check-fresh.json`
+    - screenshots: `console-before-scroll-fresh.png`, `console-after-scroll-fresh.png`.
+- Advanced per-segment IK tween system implemented (preview-only, non-destructive FK source):
+  - Added new shared module `animationIkTween.ts` with:
+    - `SegmentIkTweenKey`, `SegmentIkTweenSettings`, `SegmentIkTweenMap`
+    - `DEFAULT_SEGMENT_IK_TWEEN_SETTINGS`
+    - helpers: `segmentKey`, `normalizeSegmentIkTweenSettings`, `pruneSegmentIkTweenMap`
+    - runtime preview overlay: `sampleIkTweenPreviewPose(...)`
+  - Runtime behavior:
+    - FK keyframes remain source truth from `AnimationClip`.
+    - IK tween overlay is applied only to displayed timeline preview pose path.
+    - Segment-aware alpha uses segment duration override + selected easing.
+    - Supports solver (`fabrik`/`ccd`/`hybrid`), scope (`single_chain`/`limbs_only`/`whole_body_graph`), hands/feet/head inclusion, natural bend, soft reach, joint limits, damping, and influence blend.
+    - Graceful fallback: failed/non-finite chains are skipped; FK sample is returned if no successful solves.
+- App integration (`App.tsx`):
+  - Added `segmentIkTweenMap` state.
+  - Extended undo/redo `TimelineHistorySnapshot` with `segmentIkTweenMap` and restore support.
+  - Added `handlePatchSegmentIkTween(fromFrame, toFrame, patchOrNull)` with normalization/clamping and null-reset behavior.
+  - Added stale-key pruning effect for `segmentIkTweenMap` keyed off current valid keyframe segments.
+  - Playback/scrub preview now uses `sampleIkTweenPreviewPose(...)`; authored `rotations` remain FK-source and are not implicitly baked.
+  - Wired new props into `CanvasGrid`.
+- Timeline UI integration (`components/CanvasGrid.tsx`):
+  - Extended props with `segmentIkTweenMap` and `onPatchSegmentIkTween`.
+  - Segment card now shows compact status text: `IK Tween: Off` / `IK Tween: On (xx%)`.
+  - Advanced mode segment cards now include full `IK Tween` controls:
+    - On/Off toggle
+    - Influence slider
+    - Solver select
+    - Scope select
+    - Hands/Feet/Head toggles
+    - Natural Bend / Soft Reach / Joint Limits toggles
+    - Damping slider
+    - Reset IK Tween (remove override)
+- New test coverage (`animationIkTween.test.ts`):
+  - Disabled => FK output unchanged
+  - Influence 0 => FK output unchanged
+  - Hands-only scope changes arm chain while non-target chains stay near FK
+  - Scope escalation includes broader chain influence
+  - Solver modes (`fabrik`/`ccd`/`hybrid`) return finite output
+  - Joint-limits toggle behavior verified
+  - Stale-key pruning verified
+- Validation:
+  - `npm run test -- --run` passes (6 files, 31 tests).
+  - `npm run build` passes.
+  - Playwright skill-client run produced artifacts:
+    - `output/web-game/ik-tween-segment-2026-02-24/shot-0.png`
+    - `output/web-game/ik-tween-segment-2026-02-24/shot-1.png`
+    - `output/web-game/ik-tween-segment-2026-02-24/state-0.json`
+    - `output/web-game/ik-tween-segment-2026-02-24/state-1.json`
+  - Additional DOM-level Playwright captures for timeline segment IK controls + playback topology check:
+    - `output/web-game/ik-tween-segment-2026-02-24-dom/state-dom-segment-advanced.png`
+    - `output/web-game/ik-tween-segment-2026-02-24-dom/state-dom-ik-on.png`
+    - `output/web-game/ik-tween-segment-2026-02-24-dom/state-dom-after-play.png`
+    - `output/web-game/ik-tween-segment-2026-02-24-dom/summary-dom.json` confirms keyframe list stable before/after preview playback.
+- Added top-row `Masks On/Off` quick button in grid controls:
+  - Location: `components/CanvasGrid.tsx` top control strip near `Timeline Panel`.
+  - Behavior: globally toggles body-part mask rendering on/off without changing per-part saved settings.
+  - Renderer input now receives empty mask map when masks are toggled off.
+- Validation: `npm run build` passes, `npm test -- --run` passes (6 files / 31 tests).
+- Updated `Masks` button behavior to surface on-canvas upload affordances:
+  - When `Masks On`, canvas now shows `+` handles outside the outer ring (one per renderable body part).
+  - Clicking a `+` opens the body-part-specific upload picker and routes upload to that part.
+  - Handles are styled to indicate existing mask presence and clamped within viewport bounds.
+- Adjusted top clamp so `+` handles avoid the top control row as much as possible.
+- Validation:
+  - `npm run build` passes.
+  - Visual verification screenshot: `output/web-game/body-mask-plus-handles-2026-02-24/masks-on-plus-handles-adjusted.png`.
+- Updated mask overlay handles to align with connected body parts:
+  - Each `+` handle now projects along the ray from ring center -> current part position, then sits outside the outer ring.
+  - Added dashed connector lines from each part to its handle.
+  - Added per-handle labels near each `+` marker.
+- Updated mask handle interactions:
+  - `+` click now opens upload/replace for that specific part.
+  - Label click opens mask editor for that part.
+- Added full right-rail Mask Editor that replaces timeline panel while active:
+  - Timeline panel hidden whenever a mask editor target is active.
+  - Editor controls include: mode, visibility, opacity, scale, rotate, skew X/Y, offset X/Y, blend mode, filter preset, and custom filter string.
+- Extended mask render schema and runtime transform support:
+  - New mask fields: `rotationDeg`, `skewXDeg`, `skewYDeg`, `offsetX`, `offsetY`, `blendMode`, `filter`.
+  - Renderer now applies mask transform stack + blend + filter in both projection and costume modes.
+- Streamlined timeline advanced section body-mask controls:
+  - Replaced dense per-part inline controls with guidance + quick `Open Editor` and `Masks On/Off` actions.
+- Validation:
+  - `npm run build` passes.
+  - `npm test -- --run` passes (6 files / 31 tests).
+  - Playwright visual artifacts:
+    - `output/web-game/mask-editor-aligned-handles-2026-02-24/state-1-handles-visible.png`
+    - `output/web-game/mask-editor-aligned-handles-2026-02-24/state-2-mask-editor-active.png`
+    - status: `plusCount=17`, `maskEditorVisible=1`.
+- System audit pass for rotational jitter in live posing:
+  - Root cause identified in `components/CanvasGrid.tsx`: smoothing refs (`fkTargetRotationRef`, `fkLastEventTsRef`, IK refs) were being reset on every `currentRotations` prop update.
+  - Because `currentRotations` updates continuously during drag, this destroyed temporal continuity and caused micro-stutter/jitter in rotational response.
+- Fix applied:
+  - Split prop sync and smoothing-reset concerns.
+  - `currentRotations` effect now only syncs `rotationsRef` / `lastValidRotationsRef`.
+  - Added drag-aware reset effect that clears smoothing refs only when not actively dragging that mode (`IK`/`FK`) and not during playback.
+- Validation:
+  - `npm run build` passes.
+  - `npm test -- --run` passes (6 files / 31 tests).
+  - Runtime smoke completed; artifacts written under `output/web-game/rotational-jitter-audit-2026-02-24/`.
+- Mask handle de-overlap pass for loading/default mask state:
+  - Updated `components/CanvasGrid.tsx` body-mask handle layout to prevent startup stacking at top/bottom clamps.
+  - Added viewport-safe orbit radius cap so the handle ring stays within visible bounds.
+  - Added angular repulsion/spacing relaxation over preferred joint directions so handles remain spread and deterministic while still tracking body orientation.
+- Validation:
+  - DOM overlap probe before patch: 17 handles, 10 overlapping pairs.
+  - DOM overlap probe after patch: 17 handles, 0 overlapping pairs.
+  - Artifact: `output/web-game/mask-overlap-after-v2.png`.
+  - `npm run build` passes.

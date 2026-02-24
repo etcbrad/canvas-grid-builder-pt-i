@@ -1,7 +1,7 @@
 import { BitruviusData, SkeletonRotations, WorldCoords } from './modelData';
 import { torsoHeart, waistCircle, collarShape, neckShape, armBlade, handShape, legCapsule, footSpike } from './drawingUtils';
 import { d2r } from './utils';
-import { createVitruvianGridModel, createVitruvianPlotPayload, VitruvianLine } from './adapters/vitruvianGrid';
+import { createVitruvianRuntimeGeometry, type VitruvianRuntimeGeometry } from './adapters/vitruvianGrid';
 
 export interface GhostFrameRender {
   rotations: SkeletonRotations;
@@ -27,16 +27,28 @@ export interface ImageLayerState {
   blendMode?: GlobalCompositeOperation;
 }
 
+export type BodyPartMaskMode = 'projection' | 'costume';
+
+export interface BodyPartMaskLayer {
+  src: string | null;
+  visible: boolean;
+  opacity: number; // 0..1
+  scale: number; // 10..400 (%)
+  mode?: BodyPartMaskMode;
+  rotationDeg?: number;
+  skewXDeg?: number;
+  skewYDeg?: number;
+  offsetX?: number;
+  offsetY?: number;
+  blendMode?: GlobalCompositeOperation;
+  filter?: string;
+}
+
 const DEFAULT_VISUAL_MODULE_STATE: VisualModuleState = {
   headGrid: true,
   fingerGrid: true,
   rings: true,
   background: true,
-};
-
-const HEAD_PIECE_MODEL_BOUNDS = {
-  width: 52.8,
-  height: 54,
 };
 
 interface RenderOptions {
@@ -57,8 +69,10 @@ interface RenderOptions {
   visualModules?: Partial<VisualModuleState>;
   backgroundLayer?: ImageLayerState;
   foregroundLayer?: ImageLayerState;
+  bodyPartMasks?: Record<string, BodyPartMaskLayer | undefined>;
   lotteMode?: boolean;
   gridOnlyMode?: boolean;
+  runtimeGeometry?: VitruvianRuntimeGeometry;
   showIkDebugOverlay?: boolean;
   headGridHover?: { label: string; x: number; y: number; occludedByModel: boolean } | null;
 }
@@ -110,8 +124,10 @@ export const render = (options: RenderOptions) => {
     visualModules,
     backgroundLayer,
     foregroundLayer,
+    bodyPartMasks,
     lotteMode = false,
     gridOnlyMode = false,
+    runtimeGeometry,
     showIkDebugOverlay = false,
     headGridHover = null,
   } = options;
@@ -137,43 +153,42 @@ export const render = (options: RenderOptions) => {
 
   ctx.clearRect(0, 0, width, height);
 
-  const vitruvianModel = createVitruvianGridModel({ totalHeight: 1 });
-  const vitruvianPlot = createVitruvianPlotPayload(vitruvianModel);
-  const plotWidth = vitruvianPlot.bounds.maxX - vitruvianPlot.bounds.minX;
-  const plotHeight = vitruvianPlot.bounds.maxY - vitruvianPlot.bounds.minY;
-  const gridTileHeight = vitruvianModel.square.height;
-  const plotMinX = vitruvianPlot.bounds.minX;
-  const plotMinY = vitruvianPlot.bounds.minY;
-  const circleDiameter = vitruvianModel.circle.diameter;
-  const headUnit = vitruvianModel.modules.head.unit;
-  const circleVerticalBuffer = headUnit * 0.5;
-  const scale = Math.min(viewWidth / plotWidth, viewHeight / (circleDiameter + circleVerticalBuffer * 2));
-  const headGridSquarePx = headUnit * scale;
-  const modelScale = gridOnlyMode
-    ? headGridSquarePx / Math.max(HEAD_PIECE_MODEL_BOUNDS.width, HEAD_PIECE_MODEL_BOUNDS.height)
-    : 1;
-  const circleCenter = vitruvianModel.circle.center;
-  const xOffset = viewX + viewWidth / 2 - (circleCenter.x - plotMinX) * scale;
-  const yOffset = gridOnlyMode ? 0 : (circleCenter.y - plotMinY) * scale - viewHeight / 2 + viewY;
-  const projectionCenter: [number, number] = [viewX + viewWidth / 2, viewY + viewHeight / 2];
-  const projectionReferenceRotations =
-    bitruviusData.POSES?.['T-Pose'] ??
-    bitruviusData.POSES?.['Neutral'] ??
-    bitruviusData.initialRotations;
-  const leftHeelReference = computeWorld('l_heel', projectionReferenceRotations, projectionCenter);
-  const rightHeelReference = computeWorld('r_heel', projectionReferenceRotations, projectionCenter);
-  const referenceHeelY = Math.max(leftHeelReference.y, rightHeelReference.y);
-  const referenceHeelProjectedY = projectionCenter[1] + (referenceHeelY - projectionCenter[1]) * modelScale;
-  const gridGroundScreenY = viewY + viewHeight + yOffset;
-  const modelYOffset = gridOnlyMode ? gridGroundScreenY - referenceHeelProjectedY : 0;
-  const projectModelPoint = (x: number, y: number): { x: number; y: number } => ({
-    x: projectionCenter[0] + (x - projectionCenter[0]) * modelScale,
-    y: projectionCenter[1] + (y - projectionCenter[1]) * modelScale + modelYOffset,
-  });
-  const toScreen = (x: number, y: number): { x: number; y: number } => ({
-    x: (x - plotMinX) * scale + xOffset,
-    y: viewY + viewHeight - (y - plotMinY) * scale + yOffset,
-  });
+  const resolvedRuntimeGeometry = runtimeGeometry ?? (() => {
+    const projectionCenter: [number, number] = [viewX + viewWidth / 2, viewY + viewHeight / 2];
+    const projectionReferenceRotations =
+      bitruviusData.POSES?.['T-Pose'] ??
+      bitruviusData.POSES?.['Neutral'] ??
+      bitruviusData.initialRotations;
+    const leftHeelReference = computeWorld('l_heel', projectionReferenceRotations, projectionCenter);
+    const rightHeelReference = computeWorld('r_heel', projectionReferenceRotations, projectionCenter);
+    const referenceHeelY = Math.max(leftHeelReference.y, rightHeelReference.y);
+    return createVitruvianRuntimeGeometry({
+      viewWindow: {
+        x: viewX,
+        y: viewY,
+        width: viewWidth,
+        height: viewHeight,
+      },
+      gridOnlyMode,
+      referenceHeelY,
+    });
+  })();
+  const vitruvianPlot = resolvedRuntimeGeometry.plot;
+  const plotWidth = resolvedRuntimeGeometry.plotWidth;
+  const gridTileHeight = resolvedRuntimeGeometry.gridTileHeight;
+  const headUnit = resolvedRuntimeGeometry.headUnit;
+  const scale = resolvedRuntimeGeometry.gridScale;
+  const modelScale = resolvedRuntimeGeometry.modelScale;
+  const toScreen = resolvedRuntimeGeometry.worldToScreen;
+  const toWorld = resolvedRuntimeGeometry.screenToWorld;
+  const projectModelPoint = resolvedRuntimeGeometry.projectModelPoint;
+  const linesByFamily = vitruvianPlot.lines.reduce<Record<string, typeof vitruvianPlot.lines>>((acc, line) => {
+    if (!acc[line.family]) {
+      acc[line.family] = [];
+    }
+    acc[line.family].push(line);
+    return acc;
+  }, {});
 
   const drawImageLayer = (layer: ImageLayerState | undefined) => {
     if (!layer || !layer.visible || !layer.src) {
@@ -206,6 +221,64 @@ export const render = (options: RenderOptions) => {
     ctx.restore();
   };
 
+  const drawShapePath = (
+    shape: BitruviusData['SHAPES'][string] | undefined,
+    options?: { useShapeWaistRadius?: boolean }
+  ): boolean => {
+    if (!shape || shape.type === "none") {
+      return false;
+    }
+    if (shape.type === "torso") {
+      torsoHeart(ctx);
+      return true;
+    }
+    if (shape.type === "torsoWaistPivot") {
+      ctx.save();
+      ctx.translate(0, -58);
+      torsoHeart(ctx);
+      ctx.restore();
+      return true;
+    }
+    if (shape.type === "waist") {
+      const useShapeWaistRadius = options?.useShapeWaistRadius === true;
+      waistCircle(ctx, useShapeWaistRadius ? (shape.r ?? 20) : 20);
+      return true;
+    }
+    if (shape.type === "collar") {
+      collarShape(ctx);
+      return true;
+    }
+    if (shape.type === "neck") {
+      neckShape(ctx);
+      return true;
+    }
+    if (shape.type === "customTorsoHead") {
+      ctx.save();
+      ctx.translate(0, -24.8);
+      ctx.scale(0.6, 0.6);
+      torsoHeart(ctx);
+      ctx.restore();
+      return true;
+    }
+    if (shape.type === "arm") {
+      armBlade(ctx, shape.len!, shape.rPivot!, shape.rTip!, shape.dir!);
+      return true;
+    }
+    if (shape.type === "hand") {
+      handShape(ctx, shape.r!, shape.rt!, shape.dir!);
+      return true;
+    }
+    if (shape.type === "leg") {
+      legCapsule(ctx, shape.len!, shape.rTop!, shape.rBot!);
+      return true;
+    }
+    if (shape.type === "foot") {
+      footSpike(ctx, shape.len!, shape.r!);
+      return true;
+    }
+    return false;
+  };
+
   const drawFamily = (
     family: string,
     strokeStyle: string,
@@ -214,7 +287,7 @@ export const render = (options: RenderOptions) => {
     offsetX = 0,
     offsetY = 0
   ) => {
-    const lines = vitruvianPlot.lines.filter((line) => line.family === family);
+    const lines = linesByFamily[family] ?? [];
     if (!lines.length) {
       return;
     }
@@ -254,11 +327,12 @@ export const render = (options: RenderOptions) => {
 
   drawImageLayer(backgroundLayer);
 
-  const fingerLines = vitruvianPlot.lines.filter((line) => line.family === 'finger');
+  type PlotLine = (typeof vitruvianPlot.lines)[number];
+  const fingerLines = linesByFamily.finger ?? [];
   const VERTICAL_FINGER_COLOR = lotteMode ? 'rgba(74, 56, 34, 0.26)' : 'rgba(44, 128, 135, 0.35)';
   const HORIZONTAL_FINGER_COLOR = lotteMode ? 'rgba(94, 72, 46, 0.24)' : 'rgba(116, 121, 42, 0.35)';
-  const isVerticalLine = (line: VitruvianLine) => Math.abs(line.x1 - line.x2) < Number.EPSILON;
-  const isHorizontalLine = (line: VitruvianLine) => Math.abs(line.y1 - line.y2) < Number.EPSILON;
+  const isVerticalLine = (line: PlotLine) => Math.abs(line.x1 - line.x2) < Number.EPSILON;
+  const isHorizontalLine = (line: PlotLine) => Math.abs(line.y1 - line.y2) < Number.EPSILON;
 
   const drawFingerGridTile = (offsetX: number, offsetY: number) => {
     if (!fingerLines.length) return;
@@ -277,14 +351,12 @@ export const render = (options: RenderOptions) => {
     });
   };
 
-  const pixelToWorldX = (px: number) => (px - xOffset) / scale + plotMinX;
-  const pixelToWorldY = (py: number) => plotMinY + (viewY + viewHeight + yOffset - py) / scale;
   const horizontalPadding = headUnit * 2;
-  const minWorldX = pixelToWorldX(viewX) - horizontalPadding;
-  const maxWorldX = pixelToWorldX(viewX + viewWidth) + horizontalPadding;
+  const minWorldX = toWorld(viewX, viewY).x - horizontalPadding;
+  const maxWorldX = toWorld(viewX + viewWidth, viewY).x + horizontalPadding;
   const verticalPadding = headUnit * 2;
-  const minWorldY = pixelToWorldY(viewY + viewHeight) - verticalPadding;
-  const maxWorldY = pixelToWorldY(viewY) + verticalPadding;
+  const minWorldY = toWorld(viewX, viewY + viewHeight).y - verticalPadding;
+  const maxWorldY = toWorld(viewX, viewY).y + verticalPadding;
 
   const minTileX = Math.floor((minWorldX - vitruvianPlot.bounds.minX) / plotWidth) - 1;
   const maxTileX = Math.ceil((maxWorldX - vitruvianPlot.bounds.minX) / plotWidth) + 1;
@@ -298,7 +370,7 @@ export const render = (options: RenderOptions) => {
     const reachCircles = vitruvianPlot.circles
       .filter((circle) => circle.family === 'reach')
       .sort((a, b) => b.r - a.r);
-    const ringVerticalOffset = vitruvianModel.modules.finger.unit * 0.5;
+    const ringVerticalOffset = resolvedRuntimeGeometry.ringVerticalOffsetWorld;
 
     reachCircles.forEach((circle, index) => {
       const center = toScreen(circle.cx, circle.cy + ringVerticalOffset);
@@ -342,7 +414,7 @@ export const render = (options: RenderOptions) => {
     }
   }
 
-  const center: [number, number] = projectionCenter;
+  const center: [number, number] = [resolvedRuntimeGeometry.center.x, resolvedRuntimeGeometry.center.y];
 
   const drawSkeletonLayer = (
     rots: SkeletonRotations,
@@ -388,16 +460,7 @@ export const render = (options: RenderOptions) => {
         ctx.rotate(d2r(t.angle));
         ctx.scale(modelScale, modelScale);
         ctx.beginPath();
-        if (shape.type === "torso") torsoHeart(ctx);
-        else if (shape.type === "torsoWaistPivot") { ctx.translate(0, -58); torsoHeart(ctx); }
-        else if (shape.type === "waist") waistCircle(ctx, shape.r ?? 20);
-        else if (shape.type === "collar") collarShape(ctx);
-        else if (shape.type === "neck") neckShape(ctx);
-        else if (shape.type === "customTorsoHead") { ctx.translate(0, -24.8); ctx.scale(0.6, 0.6); torsoHeart(ctx); }
-        else if (shape.type === "arm") armBlade(ctx, shape.len!, shape.rPivot!, shape.rTip!, shape.dir!);
-        else if (shape.type === "hand") handShape(ctx, shape.r!, shape.rt!, shape.dir!);
-        else if (shape.type === "leg") legCapsule(ctx, shape.len!, shape.rTop!, shape.rBot!);
-        else if (shape.type === "foot") footSpike(ctx, shape.len!, shape.r!);
+        drawShapePath(shape, { useShapeWaistRadius: true });
         ctx.fill();
         if (!isShadow || !drawShadows) ctx.stroke();
         ctx.restore();
@@ -458,6 +521,79 @@ export const render = (options: RenderOptions) => {
     positions[id] = projectModelPoint(t.x, t.y);
   });
 
+  const drawBodyPartMask = (
+    jointId: string,
+    shape: BitruviusData['SHAPES'][string] | undefined,
+    worldAngleDeg: number
+  ) => {
+    if (!shape || shape.type === 'none') {
+      return;
+    }
+    const layer = bodyPartMasks?.[jointId];
+    if (!layer || !layer.visible || !layer.src) {
+      return;
+    }
+    const image = resolveLayerImage(layer.src);
+    if (!image) {
+      return;
+    }
+
+    const pos = positions[jointId];
+    if (!pos) {
+      return;
+    }
+    const parentId = bitruviusData.JOINT_DEFS[jointId]?.parent;
+    const parentPos = parentId ? positions[parentId] : undefined;
+    const anchor = parentPos ?? pos;
+
+    const angleRad = d2r(worldAngleDeg);
+    const cosA = Math.cos(angleRad);
+    const sinA = Math.sin(angleRad);
+    const scaleSafe = Math.abs(modelScale) > 1e-6 ? modelScale : 1;
+    const dx = anchor.x - pos.x;
+    const dy = anchor.y - pos.y;
+    const localAnchorX = (dx * cosA + dy * sinA) / scaleSafe;
+    const localAnchorY = (-dx * sinA + dy * cosA) / scaleSafe;
+    const localImageScale = clampScalePercent(layer.scale) / 100 / scaleSafe;
+    const drawWidth = image.width * localImageScale;
+    const drawHeight = image.height * localImageScale;
+    const localCenterX = localAnchorX + (Number.isFinite(layer.offsetX) ? layer.offsetX as number : 0);
+    const localCenterY = localAnchorY + (Number.isFinite(layer.offsetY) ? layer.offsetY as number : 0);
+    const maskRotationRad = d2r(Number.isFinite(layer.rotationDeg) ? layer.rotationDeg as number : 0);
+    const skewX = Math.tan(d2r(Number.isFinite(layer.skewXDeg) ? layer.skewXDeg as number : 0));
+    const skewY = Math.tan(d2r(Number.isFinite(layer.skewYDeg) ? layer.skewYDeg as number : 0));
+    const mode = layer.mode === 'costume' ? 'costume' : 'projection';
+
+    ctx.save();
+    ctx.translate(pos.x, pos.y);
+    ctx.rotate(angleRad);
+    ctx.scale(modelScale, modelScale);
+    ctx.globalAlpha = clamp01(layer.opacity);
+    ctx.globalCompositeOperation = layer.blendMode ?? 'source-over';
+    ctx.filter = layer.filter && layer.filter.trim().length > 0 ? layer.filter : 'none';
+    if (mode === 'projection') {
+      ctx.save();
+      ctx.beginPath();
+      drawShapePath(shape, { useShapeWaistRadius: false });
+      ctx.clip();
+      ctx.save();
+      ctx.translate(localCenterX, localCenterY);
+      ctx.rotate(maskRotationRad);
+      ctx.transform(1, skewY, skewX, 1, 0, 0);
+      ctx.drawImage(image, -drawWidth / 2, -drawHeight / 2, drawWidth, drawHeight);
+      ctx.restore();
+      ctx.restore();
+    } else {
+      ctx.save();
+      ctx.translate(localCenterX, localCenterY);
+      ctx.rotate(maskRotationRad);
+      ctx.transform(1, skewY, skewX, 1, 0, 0);
+      ctx.drawImage(image, -drawWidth / 2, -drawHeight / 2, drawWidth, drawHeight);
+      ctx.restore();
+    }
+    ctx.restore();
+  };
+
   if (!gridOnlyMode) {
     bitruviusData.HIERARCHY.forEach(([id]) => {
       const jDef = bitruviusData.JOINT_DEFS[id];
@@ -517,19 +653,13 @@ export const render = (options: RenderOptions) => {
       ctx.rotate(d2r(t.angle));
       ctx.scale(modelScale, modelScale);
       ctx.beginPath();
-      if (shape.type === "torso") torsoHeart(ctx);
-      else if (shape.type === "torsoWaistPivot") { ctx.translate(0, -58); torsoHeart(ctx); }
-      else if (shape.type === "waist") waistCircle(ctx);
-      else if (shape.type === "collar") collarShape(ctx);
-      else if (shape.type === "neck") neckShape(ctx);
-      else if (shape.type === "customTorsoHead") { ctx.translate(0, -24.8); ctx.scale(0.6, 0.6); torsoHeart(ctx); }
-      else if (shape.type === "arm") armBlade(ctx, shape.len!, shape.rPivot!, shape.rTip!, shape.dir!);
-      else if (shape.type === "hand") handShape(ctx, shape.r!, shape.rt!, shape.dir!);
-      else if (shape.type === "leg") legCapsule(ctx, shape.len!, shape.rTop!, shape.rBot!);
-      else if (shape.type === "foot") footSpike(ctx, shape.len!, shape.r!);
+      drawShapePath(shape, { useShapeWaistRadius: false });
       ctx.fill();
       if (!isShadow) ctx.stroke();
       ctx.restore();
+      if (!isShadow) {
+        drawBodyPartMask(id, shape, t.angle);
+      }
     });
   };
 

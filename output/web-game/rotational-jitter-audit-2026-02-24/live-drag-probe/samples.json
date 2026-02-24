@@ -1,0 +1,72 @@
+[
+  {
+    "label": "down",
+    "angle": 90,
+    "raw": {
+      "id": "r_shoulder",
+      "x": 34,
+      "y": -106,
+      "angle": 90
+    }
+  },
+  {
+    "label": "move_0",
+    "angle": 90,
+    "raw": {
+      "id": "r_shoulder",
+      "x": 34,
+      "y": -106,
+      "angle": 90
+    }
+  },
+  {
+    "label": "move_1",
+    "angle": 90,
+    "raw": {
+      "id": "r_shoulder",
+      "x": 34,
+      "y": -106,
+      "angle": 90
+    }
+  },
+  {
+    "label": "move_2",
+    "angle": 90,
+    "raw": {
+      "id": "r_shoulder",
+      "x": 34,
+      "y": -106,
+      "angle": 90
+    }
+  },
+  {
+    "label": "move_3",
+    "angle": 90,
+    "raw": {
+      "id": "r_shoulder",
+      "x": 34,
+      "y": -106,
+      "angle": 90
+    }
+  },
+  {
+    "label": "move_4",
+    "angle": 90,
+    "raw": {
+      "id": "r_shoulder",
+      "x": 34,
+      "y": -106,
+      "angle": 90
+    }
+  },
+  {
+    "label": "up",
+    "angle": 90,
+    "raw": {
+      "id": "r_shoulder",
+      "x": 34,
+      "y": -106,
+      "angle": 90
+    }
+  }
+]

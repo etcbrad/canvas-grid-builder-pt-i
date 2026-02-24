@@ -15,12 +15,20 @@ import type { PoseKeyframe } from 'pose-to-pose-engine/types';
 import { createInterpolator } from './adapters/poseInterpolator';
 import * as easings from './easing';
 import type { EasingFn } from './easing';
-import type { ImageLayerState, VisualModuleState } from './renderer';
+import type { BodyPartMaskLayer, ImageLayerState, VisualModuleState } from './renderer';
+import { computeWorldPoseForSkeleton } from './fkEngine';
+import {
+  DEFAULT_SEGMENT_IK_TWEEN_SETTINGS,
+  normalizeSegmentIkTweenSettings,
+  pruneSegmentIkTweenMap,
+  sampleIkTweenPreviewPose,
+  segmentKey as ikSegmentKey,
+  type SegmentIkTweenMap,
+  type SegmentIkTweenSettings,
+} from './animationIkTween';
 
 const DEFAULT_ONION = { past: 2, future: 2, enabled: false };
-const VISUAL_MODULE_BASE_PROFILE_ID = 3000;
-const VISUAL_MODULE_LIVE_PROFILE_ID = 3001;
-const VISUAL_MODULES_3000_DEFAULT: VisualModuleState = {
+const VISUAL_MODULES_DEFAULT: VisualModuleState = {
   background: true,
   headGrid: true,
   fingerGrid: true,
@@ -45,6 +53,20 @@ const DEFAULT_FOREGROUND_IMAGE_LAYER: ImageLayerState = {
   scale: 100,
   fitMode: 'free',
   blendMode: 'source-over',
+};
+const DEFAULT_BODY_PART_MASK_LAYER: BodyPartMaskLayer = {
+  src: null,
+  visible: true,
+  opacity: 1,
+  scale: 100,
+  mode: 'projection',
+  rotationDeg: 0,
+  skewXDeg: 0,
+  skewYDeg: 0,
+  offsetX: 0,
+  offsetY: 0,
+  blendMode: 'source-over',
+  filter: 'none',
 };
 const CORE_MODULE_DEFINITIONS: CoreModuleDefinition[] = [
   {
@@ -164,6 +186,20 @@ const DEFAULT_CORE_MODULE_STATE: CoreModuleState = {
 };
 
 const DEFAULT_POSE_KEYFRAME_ID = 'frame-0';
+const HISTORY_STACK_LIMIT = 120;
+
+interface TimelineHistorySnapshot {
+  keyframes: PoseKeyframe<SkeletonRotations>[];
+  frameCount: number;
+  currentFrame: number;
+  rotations: SkeletonRotations;
+  interpolationFramesBySegment: Record<string, number>;
+  segmentIkTweenMap: SegmentIkTweenMap;
+  easing: keyof typeof easings;
+  fps: number;
+  masterPin: [number, number];
+  bodyRot: number;
+}
 
 const clampFrameCount = (value: number): number => {
   if (!Number.isFinite(value)) {
@@ -173,6 +209,16 @@ const clampFrameCount = (value: number): number => {
 };
 
 const keyframeIdFromFrame = (frame: number): string => `frame-${frame}`;
+
+const clonePoseKeyframes = (
+  keyframes: PoseKeyframe<SkeletonRotations>[]
+): PoseKeyframe<SkeletonRotations>[] => keyframes
+  .map((keyframe) => ({
+    ...keyframe,
+    pose: { ...keyframe.pose },
+    frame: typeof keyframe.frame === 'number' ? Math.round(keyframe.frame) : keyframe.frame,
+  }))
+  .sort((a, b) => Math.round((a.frame ?? 0) as number) - Math.round((b.frame ?? 0) as number));
 
 const remapSegmentInterpolationForShift = (
   interpolation: Record<string, number>,
@@ -198,6 +244,14 @@ const remapSegmentInterpolationForShift = (
     next[`${shiftedFrom}->${shiftedTo}`] = Math.min(span, Math.max(1, Math.round(duration)));
   });
   return next;
+};
+
+const cloneSegmentIkTweenMap = (map: SegmentIkTweenMap): SegmentIkTweenMap => {
+  const clone: SegmentIkTweenMap = {};
+  Object.entries(map).forEach(([segment, settings]) => {
+    clone[segment] = normalizeSegmentIkTweenSettings(settings);
+  });
+  return clone;
 };
 
 const normalizePoseKeyframes = (
@@ -303,6 +357,7 @@ const App: React.FC = () => {
   const [frameCount, setFrameCount] = useState(1);
   const [easing, setEasing] = useState<keyof typeof easings>('linear');
   const [interpolationFramesBySegment, setInterpolationFramesBySegment] = useState<Record<string, number>>({});
+  const [segmentIkTweenMap, setSegmentIkTweenMap] = useState<SegmentIkTweenMap>({});
   const clipRef = useRef<AnimationClip<SkeletonRotations>>(
     createAnimationClip(
       [{ id: DEFAULT_POSE_KEYFRAME_ID, frame: 0, pose: modelData.POSES["T-Pose"] }],
@@ -329,10 +384,12 @@ const App: React.FC = () => {
     softReachEnabled: false,
     naturalBendEnabled: true,
     fk360Enabled: true,
-    fkConstraintsEnabled: true,
+    fkConstraintsEnabled: false,
+    fkBendEnabled: false,
+    fkStretchEnabled: false,
     handshakeEnabled: true,
-    fkRotationSensitivity: 0.85,
-    fkRotationResponse: 0.85,
+    fkRotationSensitivity: 1,
+    fkRotationResponse: 1,
     rootX: 0,
     rootY: 0,
     rootRotate: 0,
@@ -369,21 +426,145 @@ const App: React.FC = () => {
   const lastRealtimeKeyframeVersionBumpRef = useRef(0);
   const [coreModules, setCoreModules] = useState<CoreModuleState>(DEFAULT_CORE_MODULE_STATE);
   const [moduleStatusLine, setModuleStatusLine] = useState('All core modules active');
-  const [visualModules3000] = useState<VisualModuleState>(VISUAL_MODULES_3000_DEFAULT);
-  const visualModules3001 = visualModules3000;
+  const [visualModules] = useState<VisualModuleState>(VISUAL_MODULES_DEFAULT);
   const [backgroundImageLayer, setBackgroundImageLayer] = useState<ImageLayerState>(DEFAULT_BACKGROUND_IMAGE_LAYER);
   const [foregroundImageLayer, setForegroundImageLayer] = useState<ImageLayerState>(DEFAULT_FOREGROUND_IMAGE_LAYER);
+  const [bodyPartMaskLayers, setBodyPartMaskLayers] = useState<Record<string, BodyPartMaskLayer>>({});
   const backgroundObjectUrlRef = useRef<string | null>(null);
   const foregroundObjectUrlRef = useRef<string | null>(null);
+  const bodyPartMaskObjectUrlRef = useRef<Record<string, string>>({});
+  const undoHistoryRef = useRef<TimelineHistorySnapshot[]>([]);
+  const redoHistoryRef = useRef<TimelineHistorySnapshot[]>([]);
+  const [historyVersion, setHistoryVersion] = useState(0);
+  const rotationGestureHasCheckpointRef = useRef(false);
+  const rotationGestureResetTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     return () => {
       revokeLayerObjectUrl(backgroundObjectUrlRef.current);
       revokeLayerObjectUrl(foregroundObjectUrlRef.current);
+      Object.values(bodyPartMaskObjectUrlRef.current).forEach((url) => {
+        revokeLayerObjectUrl(url);
+      });
       backgroundObjectUrlRef.current = null;
       foregroundObjectUrlRef.current = null;
+      bodyPartMaskObjectUrlRef.current = {};
+      if (rotationGestureResetTimerRef.current !== null) {
+        window.clearTimeout(rotationGestureResetTimerRef.current);
+        rotationGestureResetTimerRef.current = null;
+      }
     };
   }, []);
+
+  const createHistorySnapshot = useCallback((): TimelineHistorySnapshot => ({
+    keyframes: clonePoseKeyframes(clipRef.current.getKeyframes()),
+    frameCount: clampFrameCount(frameCount),
+    currentFrame: Math.max(0, Math.round(currentFrame)),
+    rotations: { ...rotations },
+    interpolationFramesBySegment: { ...interpolationFramesBySegment },
+    segmentIkTweenMap: cloneSegmentIkTweenMap(segmentIkTweenMap),
+    easing,
+    fps: Math.max(1, Math.round(fps)),
+    masterPin: [masterPin[0], masterPin[1]],
+    bodyRot,
+  }), [bodyRot, currentFrame, easing, fps, frameCount, interpolationFramesBySegment, masterPin, rotations, segmentIkTweenMap]);
+
+  const clearRotationGestureCheckpoint = useCallback(() => {
+    rotationGestureHasCheckpointRef.current = false;
+    if (rotationGestureResetTimerRef.current !== null) {
+      window.clearTimeout(rotationGestureResetTimerRef.current);
+      rotationGestureResetTimerRef.current = null;
+    }
+  }, []);
+
+  const pushUndoSnapshot = useCallback(() => {
+    undoHistoryRef.current.push(createHistorySnapshot());
+    if (undoHistoryRef.current.length > HISTORY_STACK_LIMIT) {
+      undoHistoryRef.current.splice(0, undoHistoryRef.current.length - HISTORY_STACK_LIMIT);
+    }
+    redoHistoryRef.current = [];
+    setHistoryVersion((v) => v + 1);
+  }, [createHistorySnapshot]);
+
+  const checkpointRotationGesture = useCallback(() => {
+    if (!rotationGestureHasCheckpointRef.current) {
+      pushUndoSnapshot();
+      rotationGestureHasCheckpointRef.current = true;
+    }
+    if (rotationGestureResetTimerRef.current !== null) {
+      window.clearTimeout(rotationGestureResetTimerRef.current);
+    }
+    rotationGestureResetTimerRef.current = window.setTimeout(() => {
+      rotationGestureHasCheckpointRef.current = false;
+      rotationGestureResetTimerRef.current = null;
+    }, 180);
+  }, [pushUndoSnapshot]);
+
+  const restoreHistorySnapshot = useCallback((snapshot: TimelineHistorySnapshot) => {
+    const safeFrameCount = clampFrameCount(snapshot.frameCount);
+    const safeEasing = Object.prototype.hasOwnProperty.call(easings, snapshot.easing)
+      ? snapshot.easing
+      : 'linear';
+    const safeInterpolation = { ...snapshot.interpolationFramesBySegment };
+    const safeSegmentIkTweenMap = cloneSegmentIkTweenMap(snapshot.segmentIkTweenMap ?? {});
+    const safeKeyframes = clonePoseKeyframes(snapshot.keyframes);
+
+    clipRef.current = createAnimationClip(
+      safeKeyframes,
+      safeFrameCount,
+      easings[safeEasing],
+      safeInterpolation
+    );
+
+    setFrameCount(safeFrameCount);
+    setEasing(safeEasing);
+    setInterpolationFramesBySegment(safeInterpolation);
+    setSegmentIkTweenMap(safeSegmentIkTweenMap);
+    setCurrentFrame(Math.min(Math.max(Math.round(snapshot.currentFrame), 0), safeFrameCount - 1));
+    setRotations({ ...snapshot.rotations });
+    setFps(Math.max(1, Math.round(snapshot.fps)));
+    setMasterPin([snapshot.masterPin[0], snapshot.masterPin[1]]);
+    setBodyRot(snapshot.bodyRot);
+    setKeyframesVersion((v) => v + 1);
+    lastRealtimeKeyframeVersionBumpRef.current = 0;
+  }, []);
+
+  const handleUndo = useCallback(() => {
+    if (!undoHistoryRef.current.length) {
+      return;
+    }
+    clearRotationGestureCheckpoint();
+    if (isPlayingRef.current) {
+      setIsPlaying(false);
+    }
+    const previous = undoHistoryRef.current.pop() as TimelineHistorySnapshot;
+    redoHistoryRef.current.push(createHistorySnapshot());
+    if (redoHistoryRef.current.length > HISTORY_STACK_LIMIT) {
+      redoHistoryRef.current.splice(0, redoHistoryRef.current.length - HISTORY_STACK_LIMIT);
+    }
+    restoreHistorySnapshot(previous);
+    setHistoryVersion((v) => v + 1);
+  }, [clearRotationGestureCheckpoint, createHistorySnapshot, restoreHistorySnapshot]);
+
+  const handleRedo = useCallback(() => {
+    if (!redoHistoryRef.current.length) {
+      return;
+    }
+    clearRotationGestureCheckpoint();
+    if (isPlayingRef.current) {
+      setIsPlaying(false);
+    }
+    const next = redoHistoryRef.current.pop() as TimelineHistorySnapshot;
+    undoHistoryRef.current.push(createHistorySnapshot());
+    if (undoHistoryRef.current.length > HISTORY_STACK_LIMIT) {
+      undoHistoryRef.current.splice(0, undoHistoryRef.current.length - HISTORY_STACK_LIMIT);
+    }
+    restoreHistorySnapshot(next);
+    setHistoryVersion((v) => v + 1);
+  }, [clearRotationGestureCheckpoint, createHistorySnapshot, restoreHistorySnapshot]);
+
+  const canUndo = useMemo(() => undoHistoryRef.current.length > 0, [historyVersion]);
+  const canRedo = useMemo(() => redoHistoryRef.current.length > 0, [historyVersion]);
 
   const handleBackgroundImageUpload = useCallback((file: File) => {
     const nextUrl = URL.createObjectURL(file);
@@ -438,6 +619,51 @@ const App: React.FC = () => {
     setForegroundImageLayer((prev) => ({
       ...prev,
       ...patch,
+    }));
+  }, []);
+
+  const clearBodyPartMaskObjectUrl = useCallback((jointId: string) => {
+    const existingUrl = bodyPartMaskObjectUrlRef.current[jointId];
+    revokeLayerObjectUrl(existingUrl);
+    delete bodyPartMaskObjectUrlRef.current[jointId];
+  }, []);
+
+  const handleUploadBodyPartMaskLayer = useCallback((jointId: string, file: File) => {
+    const nextUrl = URL.createObjectURL(file);
+    clearBodyPartMaskObjectUrl(jointId);
+    bodyPartMaskObjectUrlRef.current[jointId] = nextUrl;
+    setBodyPartMaskLayers((prev) => ({
+      ...prev,
+      [jointId]: {
+        ...DEFAULT_BODY_PART_MASK_LAYER,
+        ...(prev[jointId] ?? {}),
+        src: nextUrl,
+        visible: true,
+      },
+    }));
+  }, [clearBodyPartMaskObjectUrl]);
+
+  const handleClearBodyPartMaskLayer = useCallback((jointId: string) => {
+    clearBodyPartMaskObjectUrl(jointId);
+    setBodyPartMaskLayers((prev) => ({
+      ...prev,
+      [jointId]: {
+        ...DEFAULT_BODY_PART_MASK_LAYER,
+        ...(prev[jointId] ?? {}),
+        src: null,
+        visible: false,
+      },
+    }));
+  }, [clearBodyPartMaskObjectUrl]);
+
+  const handlePatchBodyPartMaskLayer = useCallback((jointId: string, patch: Partial<BodyPartMaskLayer>) => {
+    setBodyPartMaskLayers((prev) => ({
+      ...prev,
+      [jointId]: {
+        ...DEFAULT_BODY_PART_MASK_LAYER,
+        ...(prev[jointId] ?? {}),
+        ...patch,
+      },
     }));
   }, []);
 
@@ -597,7 +823,9 @@ const App: React.FC = () => {
     softReachEnabled: false,
     naturalBendEnabled: coreModules.ik_engine ? movementToggles.naturalBendEnabled !== false : false,
     fk360Enabled: coreModules.fk_engine ? movementToggles.fk360Enabled !== false : false,
-    fkConstraintsEnabled: coreModules.fk_engine ? movementToggles.fkConstraintsEnabled !== false : false,
+    fkConstraintsEnabled: coreModules.fk_engine ? movementToggles.fkConstraintsEnabled === true : false,
+    fkBendEnabled: coreModules.fk_engine ? movementToggles.fkBendEnabled === true : false,
+    fkStretchEnabled: coreModules.fk_engine ? movementToggles.fkStretchEnabled === true : false,
     handshakeEnabled: coreModules.constraint_bridge ? movementToggles.handshakeEnabled !== false : false,
     fkRotationSensitivity: movementToggles.fkRotationSensitivity,
     fkRotationResponse: movementToggles.fkRotationResponse,
@@ -699,11 +927,13 @@ const App: React.FC = () => {
     }
   }, [coreModules.onion_skin, onionSkinConfig.enabled]);
 
-  const mirrorPose = () => {
+  const mirrorPose = useCallback(() => {
     if (!coreModules.interaction_engine) {
       setModuleStatusLine('Interaction Engine is off. Mirror is disabled.');
       return;
     }
+    clearRotationGestureCheckpoint();
+    pushUndoSnapshot();
     const newRots = { ...rotations };
     const pairs: [string, string][] = [
       ['l_shoulder', 'r_shoulder'], ['l_elbow', 'r_elbow'], ['l_palm', 'r_palm'], ['l_fingertip', 'r_fingertip'],
@@ -719,13 +949,23 @@ const App: React.FC = () => {
       upsertPoseKeyframe(currentFrame, newRots);
       setKeyframesVersion((v) => v + 1);
     }
-  };
+  }, [
+    clearRotationGestureCheckpoint,
+    coreModules.animation_engine,
+    coreModules.interaction_engine,
+    currentFrame,
+    pushUndoSnapshot,
+    rotations,
+    upsertPoseKeyframe,
+  ]);
 
-  const resetPose = () => {
+  const resetPose = useCallback(() => {
     if (!coreModules.interaction_engine) {
       setModuleStatusLine('Interaction Engine is off. Reset is disabled.');
       return;
     }
+    clearRotationGestureCheckpoint();
+    pushUndoSnapshot();
     setRotations(modelData.POSES["T-Pose"]);
     setMasterPin([0, 0]);
     setBodyRot(0);
@@ -733,7 +973,14 @@ const App: React.FC = () => {
       upsertPoseKeyframe(currentFrame, modelData.POSES["T-Pose"]);
       setKeyframesVersion((v) => v + 1);
     }
-  };
+  }, [
+    clearRotationGestureCheckpoint,
+    coreModules.animation_engine,
+    coreModules.interaction_engine,
+    currentFrame,
+    pushUndoSnapshot,
+    upsertPoseKeyframe,
+  ]);
 
   const syncRotationsFromClip = useCallback(() => {
     const clip = clipRef.current;
@@ -754,30 +1001,167 @@ const App: React.FC = () => {
   const playbackPreviewRotations = useMemo(() => {
     const clip = clipRef.current;
     try {
-      return clip.sampleFrame(currentFrame);
+      return sampleIkTweenPreviewPose({
+        clip,
+        currentFrame,
+        easingFn: easings[easing],
+        segmentInterpolationFrames: interpolationFramesBySegment,
+        segmentIkTweenMap,
+        bitruviusData: modelData,
+        canvasCenter: [0, 0],
+        rootTransform: {
+          x: effectiveMovementToggles.rootX ?? 0,
+          y: effectiveMovementToggles.rootY ?? 0,
+          rotate: effectiveMovementToggles.rootRotate ?? 0,
+        },
+        ikEngineEnabled: coreModules.ik_engine,
+      });
     } catch {
       return rotations;
     }
-  }, [currentFrame, keyframesVersion, frameCount, easing, interpolationFramesBySegment, rotations]);
+  }, [
+    coreModules.ik_engine,
+    currentFrame,
+    easing,
+    effectiveMovementToggles.rootRotate,
+    effectiveMovementToggles.rootX,
+    effectiveMovementToggles.rootY,
+    interpolationFramesBySegment,
+    keyframesVersion,
+    rotations,
+    segmentIkTweenMap,
+  ]);
 
-  const displayedRotations = isPlaying ? playbackPreviewRotations : rotations;
+  const displayedRotations = coreModules.animation_engine ? playbackPreviewRotations : rotations;
+
+  const renderGameTextState = useMemo(() => {
+    const worldByJoint = computeWorldPoseForSkeleton(
+      modelData.JOINT_DEFS,
+      displayedRotations,
+      [0, 0],
+      {
+        x: effectiveMovementToggles.rootX ?? 0,
+        y: effectiveMovementToggles.rootY ?? 0,
+        rotate: effectiveMovementToggles.rootRotate ?? 0,
+      }
+    );
+
+    const joints = Object.entries(worldByJoint)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([jointId, world]) => ({
+        id: jointId,
+        x: Number(world.x.toFixed(3)),
+        y: Number(world.y.toFixed(3)),
+        angle: Number(world.angle.toFixed(3)),
+      }));
+
+    return {
+      coordinateSystem: {
+        origin: 'canvas_center',
+        axes: '+x right, +y down',
+        angles: 'degrees',
+      },
+      mode: coreModules.ik_engine ? interactionMode : 'FK',
+      playing: isPlaying,
+      frame: Number(currentFrame.toFixed(3)),
+      frameCount,
+      fps,
+      fkAssist: {
+        bendEnabled: effectiveMovementToggles.fkBendEnabled === true,
+        stretchEnabled: effectiveMovementToggles.fkStretchEnabled === true,
+      },
+      root: {
+        x: Number((effectiveMovementToggles.rootX ?? 0).toFixed(3)),
+        y: Number((effectiveMovementToggles.rootY ?? 0).toFixed(3)),
+        rotate: Number((effectiveMovementToggles.rootRotate ?? 0).toFixed(3)),
+      },
+      keyframes: clipRef.current
+        .getKeyframes()
+        .map((keyframe) => (typeof keyframe.frame === 'number' ? Math.round(keyframe.frame) : null))
+        .filter((value): value is number => value !== null)
+        .sort((a, b) => a - b),
+      joints,
+    };
+  }, [
+    coreModules.ik_engine,
+    currentFrame,
+    displayedRotations,
+    effectiveMovementToggles.fkBendEnabled,
+    effectiveMovementToggles.fkStretchEnabled,
+    effectiveMovementToggles.rootRotate,
+    effectiveMovementToggles.rootX,
+    effectiveMovementToggles.rootY,
+    fps,
+    frameCount,
+    interactionMode,
+    isPlaying,
+    keyframesVersion,
+  ]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    const runtimeWindow = window as Window & {
+      render_game_to_text?: () => string;
+      advanceTime?: (ms: number) => void;
+    };
+
+    runtimeWindow.render_game_to_text = () => JSON.stringify(renderGameTextState);
+    runtimeWindow.advanceTime = (ms: number) => {
+      const safeMs = Number.isFinite(ms) ? Math.max(0, ms) : 0;
+      if (safeMs <= 0) {
+        return;
+      }
+
+      const framesToAdvance = (safeMs / 1000) * Math.max(1, fps);
+      const { startFrame, endFrame } = getPlaybackRange();
+      const span = endFrame - startFrame;
+      if (span <= 1e-6) {
+        currentFrameRef.current = startFrame;
+        setCurrentFrame(startFrame);
+        return;
+      }
+
+      setCurrentFrame((previousFrame) => {
+        const clampedPrev = Math.min(Math.max(previousFrame, startFrame), endFrame);
+        const wrappedOffset = ((clampedPrev - startFrame + framesToAdvance) % span + span) % span;
+        const nextFrame = startFrame + wrappedOffset;
+        currentFrameRef.current = nextFrame;
+        return nextFrame;
+      });
+    };
+
+    return () => {
+      delete runtimeWindow.render_game_to_text;
+      delete runtimeWindow.advanceTime;
+    };
+  }, [fps, getPlaybackRange, renderGameTextState]);
 
   const handleRotationsChange = useCallback((newRots: SkeletonRotations) => {
     if (!coreModules.interaction_engine) {
       return;
     }
+    checkpointRotationGesture();
     setRotations(newRots);
     if (!coreModules.animation_engine) {
       return;
     }
     upsertPoseKeyframe(currentFrame, newRots);
     const now = performance.now();
-    // Prevent timeline UI thrash during continuous FK drag updates.
-    if (now - lastRealtimeKeyframeVersionBumpRef.current >= 120) {
+    // Keep animation/preview responsive during continuous FK drag.
+    if (now - lastRealtimeKeyframeVersionBumpRef.current >= 16) {
       lastRealtimeKeyframeVersionBumpRef.current = now;
       setKeyframesVersion((v) => v + 1);
     }
-  }, [coreModules.animation_engine, coreModules.interaction_engine, currentFrame, upsertPoseKeyframe]);
+  }, [
+    checkpointRotationGesture,
+    coreModules.animation_engine,
+    coreModules.interaction_engine,
+    currentFrame,
+    upsertPoseKeyframe,
+  ]);
 
   const keyframeFrames = useMemo(() => (
     clipRef.current
@@ -839,14 +1223,40 @@ const App: React.FC = () => {
     });
   }, [keyframeFrames]);
 
+  useEffect(() => {
+    setSegmentIkTweenMap((prev) => {
+      if (!Object.keys(prev).length) {
+        return prev;
+      }
+      const validPairs = new Set<string>();
+      for (let index = 0; index < keyframeFrames.length - 1; index += 1) {
+        const fromFrame = Math.round(keyframeFrames[index]);
+        const toFrame = Math.round(keyframeFrames[index + 1]);
+        if (toFrame > fromFrame) {
+          validPairs.add(ikSegmentKey(fromFrame, toFrame));
+        }
+      }
+      return pruneSegmentIkTweenMap(prev, validPairs);
+    });
+  }, [keyframeFrames]);
+
   const handleSetKeyframe = useCallback(() => {
     if (!coreModules.animation_engine) {
       setModuleStatusLine('Enable Animation Engine to write keyframes.');
       return;
     }
+    clearRotationGestureCheckpoint();
+    pushUndoSnapshot();
     upsertPoseKeyframe(currentFrame, rotations);
     setKeyframesVersion((v) => v + 1);
-  }, [coreModules.animation_engine, currentFrame, rotations, upsertPoseKeyframe]);
+  }, [
+    clearRotationGestureCheckpoint,
+    coreModules.animation_engine,
+    currentFrame,
+    pushUndoSnapshot,
+    rotations,
+    upsertPoseKeyframe,
+  ]);
 
   const handleRemoveKeyframe = useCallback(() => {
     if (!coreModules.animation_engine) {
@@ -854,18 +1264,29 @@ const App: React.FC = () => {
       return;
     }
     if (!isCurrentFrameKeyframe) return;
+    clearRotationGestureCheckpoint();
+    pushUndoSnapshot();
     clipRef.current.removeKeyframe(keyframeIdFromFrame(Math.round(currentFrame)));
     setKeyframesVersion((v) => v + 1);
     syncRotationsFromClip();
-  }, [coreModules.animation_engine, currentFrame, isCurrentFrameKeyframe, syncRotationsFromClip]);
+  }, [
+    clearRotationGestureCheckpoint,
+    coreModules.animation_engine,
+    currentFrame,
+    isCurrentFrameKeyframe,
+    pushUndoSnapshot,
+    syncRotationsFromClip,
+  ]);
 
   const handleSavePoseToFrame = useCallback((frame: number) => {
     if (!coreModules.animation_engine) return;
+    clearRotationGestureCheckpoint();
+    pushUndoSnapshot();
     const safeFrame = Math.max(0, Math.round(frame));
     upsertPoseKeyframe(safeFrame, rotations);
     setCurrentFrame(safeFrame);
     setKeyframesVersion((v) => v + 1);
-  }, [coreModules.animation_engine, rotations, upsertPoseKeyframe]);
+  }, [clearRotationGestureCheckpoint, coreModules.animation_engine, pushUndoSnapshot, rotations, upsertPoseKeyframe]);
 
   const handleApplyPoseLibraryToFrame = useCallback((frame: number, poseName: string) => {
     if (!coreModules.animation_engine) {
@@ -885,11 +1306,13 @@ const App: React.FC = () => {
       ...pose,
     };
 
+    clearRotationGestureCheckpoint();
+    pushUndoSnapshot();
     upsertPoseKeyframe(safeFrame, nextPose);
     setRotations(nextPose);
     setCurrentFrame(safeFrame);
     setKeyframesVersion((v) => v + 1);
-  }, [coreModules.animation_engine, upsertPoseKeyframe]);
+  }, [clearRotationGestureCheckpoint, coreModules.animation_engine, pushUndoSnapshot, upsertPoseKeyframe]);
 
   const handleSwapKeyframeFrames = useCallback((fromFrame: number, toFrame: number) => {
     if (!coreModules.animation_engine) return;
@@ -901,6 +1324,8 @@ const App: React.FC = () => {
     const toPose = keyframePoseMap[roundedTo];
     if (!fromPose && !toPose) return;
 
+    clearRotationGestureCheckpoint();
+    pushUndoSnapshot();
     if (fromPose) {
       upsertPoseKeyframe(roundedTo, fromPose);
     } else {
@@ -914,7 +1339,7 @@ const App: React.FC = () => {
     }
 
     setKeyframesVersion((v) => v + 1);
-  }, [coreModules.animation_engine, keyframePoseMap, upsertPoseKeyframe]);
+  }, [clearRotationGestureCheckpoint, coreModules.animation_engine, keyframePoseMap, pushUndoSnapshot, upsertPoseKeyframe]);
 
   const handleInsertTweenBetween = useCallback((fromFrame: number, toFrame: number) => {
     if (!coreModules.animation_engine) {
@@ -948,10 +1373,12 @@ const App: React.FC = () => {
       return;
     }
 
+    clearRotationGestureCheckpoint();
+    pushUndoSnapshot();
     const tweenPose = clipRef.current.sampleFrame(targetFrame);
     upsertPoseKeyframe(targetFrame, tweenPose);
     setKeyframesVersion((v) => v + 1);
-  }, [coreModules.animation_engine, upsertPoseKeyframe]);
+  }, [clearRotationGestureCheckpoint, coreModules.animation_engine, pushUndoSnapshot, upsertPoseKeyframe]);
 
   const handleAdjustSegmentInBetweens = useCallback((fromFrame: number, toFrame: number, delta: number) => {
     if (!coreModules.animation_engine) {
@@ -986,6 +1413,8 @@ const App: React.FC = () => {
       return;
     }
 
+    clearRotationGestureCheckpoint();
+    pushUndoSnapshot();
     const pivotFrame = end;
     const shiftBy = direction > 0 ? 1 : -1;
     const shiftedKeyframes = keyframes.map((keyframe) => {
@@ -1016,7 +1445,7 @@ const App: React.FC = () => {
       return Math.max(0, Math.min(nextFrameCount - 1, shifted));
     });
     setKeyframesVersion((v) => v + 1);
-  }, [coreModules.animation_engine, interpolationFramesBySegment, easing]);
+  }, [clearRotationGestureCheckpoint, coreModules.animation_engine, interpolationFramesBySegment, easing, pushUndoSnapshot]);
 
   const handleSetSegmentInterpolation = useCallback((fromFrame: number, toFrame: number, frames: number | null) => {
     if (!coreModules.animation_engine) {
@@ -1031,16 +1460,97 @@ const App: React.FC = () => {
     }
     const span = Math.max(1, end - start);
     const key = `${start}->${end}`;
+    const currentValue = interpolationFramesBySegment[key];
+    const nextValue = (frames === null || !Number.isFinite(frames) || frames <= 0)
+      ? null
+      : Math.min(span, Math.max(1, Math.round(frames)));
+    if ((currentValue ?? null) === nextValue) {
+      return;
+    }
+    clearRotationGestureCheckpoint();
+    pushUndoSnapshot();
     setInterpolationFramesBySegment((prev) => {
       const next = { ...prev };
-      if (frames === null || !Number.isFinite(frames) || frames <= 0) {
+      if (nextValue === null) {
         delete next[key];
       } else {
-        next[key] = Math.min(span, Math.max(1, Math.round(frames)));
+        next[key] = nextValue;
       }
       return next;
     });
-  }, [coreModules.animation_engine]);
+  }, [clearRotationGestureCheckpoint, coreModules.animation_engine, interpolationFramesBySegment, pushUndoSnapshot]);
+
+  const handlePatchSegmentIkTween = useCallback((
+    fromFrame: number,
+    toFrame: number,
+    patchOrNull: Partial<SegmentIkTweenSettings> | null
+  ) => {
+    if (!coreModules.animation_engine) {
+      return;
+    }
+    const roundedFrom = Math.round(fromFrame);
+    const roundedTo = Math.round(toFrame);
+    const start = Math.min(roundedFrom, roundedTo);
+    const end = Math.max(roundedFrom, roundedTo);
+    if (end <= start) {
+      return;
+    }
+    const key = ikSegmentKey(start, end);
+    const currentSettings = segmentIkTweenMap[key];
+    if (patchOrNull === null) {
+      if (!currentSettings) {
+        return;
+      }
+      clearRotationGestureCheckpoint();
+      pushUndoSnapshot();
+      setSegmentIkTweenMap((prev) => {
+        if (!prev[key]) {
+          return prev;
+        }
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      });
+      return;
+    }
+
+    const base = currentSettings
+      ? normalizeSegmentIkTweenSettings(currentSettings)
+      : DEFAULT_SEGMENT_IK_TWEEN_SETTINGS;
+    const nextSettings = normalizeSegmentIkTweenSettings({
+      ...base,
+      ...patchOrNull,
+    });
+
+    const unchanged = currentSettings && (
+      currentSettings.enabled === nextSettings.enabled &&
+      currentSettings.influence === nextSettings.influence &&
+      currentSettings.solver === nextSettings.solver &&
+      currentSettings.solveMode === nextSettings.solveMode &&
+      currentSettings.includeHands === nextSettings.includeHands &&
+      currentSettings.includeFeet === nextSettings.includeFeet &&
+      currentSettings.includeHead === nextSettings.includeHead &&
+      currentSettings.naturalBendEnabled === nextSettings.naturalBendEnabled &&
+      currentSettings.softReachEnabled === nextSettings.softReachEnabled &&
+      currentSettings.enforceJointLimits === nextSettings.enforceJointLimits &&
+      currentSettings.damping === nextSettings.damping
+    );
+    if (unchanged) {
+      return;
+    }
+
+    clearRotationGestureCheckpoint();
+    pushUndoSnapshot();
+    setSegmentIkTweenMap((prev) => ({
+      ...prev,
+      [key]: nextSettings,
+    }));
+  }, [
+    clearRotationGestureCheckpoint,
+    coreModules.animation_engine,
+    pushUndoSnapshot,
+    segmentIkTweenMap,
+  ]);
 
   const handleRemovePoseAtFrame = useCallback((frame: number) => {
     if (!coreModules.animation_engine) {
@@ -1055,12 +1565,14 @@ const App: React.FC = () => {
     if (!hasKeyframe) {
       return;
     }
+    clearRotationGestureCheckpoint();
+    pushUndoSnapshot();
     clipRef.current.removeKeyframe(keyframeIdFromFrame(roundedFrame));
     setKeyframesVersion((v) => v + 1);
     if (Math.round(currentFrame) === roundedFrame) {
       syncRotationsFromClip();
     }
-  }, [coreModules.animation_engine, frameCount, currentFrame, syncRotationsFromClip]);
+  }, [clearRotationGestureCheckpoint, coreModules.animation_engine, frameCount, currentFrame, pushUndoSnapshot, syncRotationsFromClip]);
 
   const ghostFrames = useMemo(() => {
     if (!coreModules.onion_skin || !onionSkinConfig.enabled) return undefined;
@@ -1072,13 +1584,15 @@ const App: React.FC = () => {
     }));
   }, [coreModules.onion_skin, currentFrame, onionSkinConfig, keyframesVersion]);
 
-  const applyPose = (poseName: string) => {
+  const applyPose = useCallback((poseName: string) => {
     if (!coreModules.interaction_engine) {
       setModuleStatusLine('Interaction Engine is off. Pose presets are locked.');
       return;
     }
     const pose = modelData.POSES[poseName];
     if (pose) {
+      clearRotationGestureCheckpoint();
+      pushUndoSnapshot();
       const newRots = { ...rotations, ...pose };
       setRotations(newRots);
       if (coreModules.animation_engine) {
@@ -1086,7 +1600,15 @@ const App: React.FC = () => {
         setKeyframesVersion((v) => v + 1);
       }
     }
-  };
+  }, [
+    clearRotationGestureCheckpoint,
+    coreModules.animation_engine,
+    coreModules.interaction_engine,
+    currentFrame,
+    pushUndoSnapshot,
+    rotations,
+    upsertPoseKeyframe,
+  ]);
 
   const calibrateMocap = () => {
     if (!coreModules.interaction_engine) {
@@ -1106,11 +1628,10 @@ const App: React.FC = () => {
     Object.entries(rotations).forEach(([id, deg]) => {
       s += `${id}:${deg};`;
     });
-    const visual3000Bits = `bg${visualModules3000.background ? 1 : 0}-hg${visualModules3000.headGrid ? 1 : 0}-fg${visualModules3000.fingerGrid ? 1 : 0}-rg${visualModules3000.rings ? 1 : 0}`;
-    const visual3001Bits = `bg${visualModules3001.background ? 1 : 0}-hg${visualModules3001.headGrid ? 1 : 0}-fg${visualModules3001.fingerGrid ? 1 : 0}-rg${visualModules3001.rings ? 1 : 0}`;
-    s += `v:1;ss:${safeSwitch ? 1 : 0};tm:${mocapMode ? 1 : 0};sm:${silhouetteMode ? 1 : 0};lm:${lotteMode ? 1 : 0};b:0.15;hp:0;vm_base:${VISUAL_MODULE_BASE_PROFILE_ID};vm_live:${VISUAL_MODULE_LIVE_PROFILE_ID};vm_coupled:1;vm3000:${visual3000Bits};vm3001:${visual3001Bits}`;
+    const visualBits = `bg${visualModules.background ? 1 : 0}-hg${visualModules.headGrid ? 1 : 0}-fg${visualModules.fingerGrid ? 1 : 0}-rg${visualModules.rings ? 1 : 0}`;
+    s += `v:1;ss:${safeSwitch ? 1 : 0};tm:${mocapMode ? 1 : 0};sm:${silhouetteMode ? 1 : 0};lm:${lotteMode ? 1 : 0};b:0.15;hp:0;vm:${visualBits}`;
     return s;
-  }, [rotations, masterPin, bodyRot, safeSwitch, mocapMode, silhouetteMode, lotteMode, visualModules3000.background, visualModules3000.fingerGrid, visualModules3000.headGrid, visualModules3000.rings, visualModules3001.background, visualModules3001.fingerGrid, visualModules3001.headGrid, visualModules3001.rings]);
+  }, [rotations, masterPin, bodyRot, safeSwitch, mocapMode, silhouetteMode, lotteMode, visualModules.background, visualModules.fingerGrid, visualModules.headGrid, visualModules.rings]);
 
   const handleStringInput = (input: string) => {
     try {
@@ -1187,7 +1708,73 @@ const App: React.FC = () => {
     setOnionSkinConfig(nextConfig);
   }, [coreModules.onion_skin]);
 
+  const handleFpsChange = useCallback((nextFps: number) => {
+    const safeFps = Number.isFinite(nextFps) ? Math.max(1, Math.round(nextFps)) : fps;
+    if (safeFps === fps) {
+      return;
+    }
+    clearRotationGestureCheckpoint();
+    pushUndoSnapshot();
+    setFps(safeFps);
+  }, [clearRotationGestureCheckpoint, fps, pushUndoSnapshot]);
+
+  const handleFrameCountChange = useCallback((nextFrameCount: number) => {
+    const safeFrameCount = clampFrameCount(nextFrameCount);
+    if (safeFrameCount === frameCount) {
+      return;
+    }
+    clearRotationGestureCheckpoint();
+    pushUndoSnapshot();
+    setFrameCount(safeFrameCount);
+    setCurrentFrame((prev) => Math.min(Math.max(0, Math.round(prev)), safeFrameCount - 1));
+  }, [clearRotationGestureCheckpoint, frameCount, pushUndoSnapshot]);
+
+  const handleEasingChange = useCallback((nextEasing: string) => {
+    const safeEasing = Object.prototype.hasOwnProperty.call(easings, nextEasing)
+      ? (nextEasing as keyof typeof easings)
+      : easing;
+    if (safeEasing === easing) {
+      return;
+    }
+    clearRotationGestureCheckpoint();
+    pushUndoSnapshot();
+    setEasing(safeEasing);
+  }, [clearRotationGestureCheckpoint, easing, pushUndoSnapshot]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT' ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+      if (!(event.metaKey || event.ctrlKey)) {
+        return;
+      }
+      const key = event.key.toLowerCase();
+      if (key === 'z') {
+        event.preventDefault();
+        if (event.shiftKey) {
+          handleRedo();
+        } else {
+          handleUndo();
+        }
+      } else if (key === 'y') {
+        event.preventDefault();
+        handleRedo();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [handleRedo, handleUndo]);
+
   const animationControlsDisabled = !coreModules.animation_engine;
+  const easingOptionNames = useMemo(() => Object.keys(easings), []);
 
   return (
     <div className="w-screen h-screen overflow-hidden flex flex-col items-center justify-center bg-[#f8f8fc] font-mono text-zinc-500">
@@ -1320,16 +1907,16 @@ const App: React.FC = () => {
           </button>
           <div className="flex items-center gap-1">
             <label htmlFor="fps" className="text-zinc-500">FPS</label>
-            <input id="fps" type="number" value={fps} disabled={animationControlsDisabled} onChange={e => setFps(Number(e.target.value))} className="w-12 bg-zinc-950 border border-zinc-800 rounded px-2 py-0.5 text-zinc-300 disabled:opacity-45 disabled:cursor-not-allowed" />
+            <input id="fps" type="number" value={fps} disabled={animationControlsDisabled} onChange={e => handleFpsChange(Number(e.target.value))} className="w-12 bg-zinc-950 border border-zinc-800 rounded px-2 py-0.5 text-zinc-300 disabled:opacity-45 disabled:cursor-not-allowed" />
           </div>
           <div className="flex items-center gap-1">
             <label htmlFor="frames" className="text-zinc-500">Frames</label>
-            <input id="frames" type="number" value={frameCount} disabled={animationControlsDisabled} onChange={e => setFrameCount(clampFrameCount(Number(e.target.value)))} className="w-16 bg-zinc-950 border border-zinc-800 rounded px-2 py-0.5 text-zinc-300 disabled:opacity-45 disabled:cursor-not-allowed" />
+            <input id="frames" type="number" value={frameCount} disabled={animationControlsDisabled} onChange={e => handleFrameCountChange(Number(e.target.value))} className="w-16 bg-zinc-950 border border-zinc-800 rounded px-2 py-0.5 text-zinc-300 disabled:opacity-45 disabled:cursor-not-allowed" />
           </div>
           <div className="flex items-center gap-1">
             <label htmlFor="easing" className="text-zinc-500">Easing</label>
-            <select id="easing" value={easing} disabled={animationControlsDisabled} onChange={e => setEasing(e.target.value as keyof typeof easings)} className="bg-zinc-950 border border-zinc-800 rounded px-2 py-0.5 text-zinc-300 disabled:opacity-45 disabled:cursor-not-allowed">
-              {Object.keys(easings).map(name => <option key={name} value={name}>{name}</option>)}
+            <select id="easing" value={easing} disabled={animationControlsDisabled} onChange={e => handleEasingChange(e.target.value)} className="bg-zinc-950 border border-zinc-800 rounded px-2 py-0.5 text-zinc-300 disabled:opacity-45 disabled:cursor-not-allowed">
+              {easingOptionNames.map(name => <option key={name} value={name}>{name}</option>)}
             </select>
           </div>
         </div>
@@ -1342,7 +1929,8 @@ const App: React.FC = () => {
           majorGridSize={64} majorGridColor="rgba(128, 0, 128, 0.4)" majorGridWidth={1}
           minorGridSize={8} minorGridColor="rgba(0, 255, 0, 0.2)" minorGridWidth={0.5}
           ruleOfThirdsColor="rgba(0, 0, 0, 0.6)" ruleOfThirdsWidth={1.5}
-          bitruviusData={{...modelData, initialRotations: displayedRotations}}
+          bitruviusData={modelData}
+          currentRotations={displayedRotations}
           mocapMode={mocapMode}
           safeSwitch={safeSwitch}
           silhouetteMode={silhouetteMode}
@@ -1351,21 +1939,30 @@ const App: React.FC = () => {
           interactionMode={coreModules.ik_engine ? interactionMode : "FK"}
           onInteractionModeChange={handleToggleInteractionMode}
           onToggleLotteMode={() => setLotteMode((prev) => !prev)}
+          onReturnDefaultPose={coreModules.interaction_engine ? resetPose : undefined}
+          onUndo={handleUndo}
+          onRedo={handleRedo}
+          canUndo={canUndo}
+          canRedo={canRedo}
           movementToggles={effectiveMovementToggles}
           onMovementTogglesChange={handleMovementTogglesChange}
           onPoseApply={coreModules.interaction_engine ? applyPose : undefined}
           onRotationsChange={coreModules.interaction_engine ? handleRotationsChange : undefined}
           ghostFrames={ghostFrames}
           onMasterPinChange={setMasterPin}
-          visualModules={visualModules3001}
+          visualModules={visualModules}
           backgroundImageLayer={backgroundImageLayer}
           foregroundImageLayer={foregroundImageLayer}
+          bodyPartMaskLayers={bodyPartMaskLayers}
           onUploadBackgroundImageLayer={handleBackgroundImageUpload}
           onUploadForegroundImageLayer={handleForegroundImageUpload}
+          onUploadBodyPartMaskLayer={handleUploadBodyPartMaskLayer}
           onClearBackgroundImageLayer={handleClearBackgroundImageLayer}
           onClearForegroundImageLayer={handleClearForegroundImageLayer}
+          onClearBodyPartMaskLayer={handleClearBodyPartMaskLayer}
           onPatchBackgroundImageLayer={handlePatchBackgroundImageLayer}
           onPatchForegroundImageLayer={handlePatchForegroundImageLayer}
+          onPatchBodyPartMaskLayer={handlePatchBodyPartMaskLayer}
           gridOnlyMode={gridViewMode}
           isPlaying={isPlaying}
           onTogglePlayback={animationControlsDisabled ? undefined : () => setIsPlaying((prev) => !prev)}
@@ -1374,15 +1971,15 @@ const App: React.FC = () => {
           frameCount={frameCount}
           fps={fps}
           easing={easing}
-          easingOptions={Object.keys(easings)}
+          easingOptions={easingOptionNames}
           keyframeFrames={keyframeFrames}
           isCurrentFrameKeyframe={isCurrentFrameKeyframe}
           onSetCurrentFrame={animationControlsDisabled ? undefined : handleSetCurrentFrame}
           onSetKeyframe={animationControlsDisabled ? undefined : handleSetKeyframe}
           onRemoveKeyframe={animationControlsDisabled ? undefined : handleRemoveKeyframe}
-          onFpsChange={animationControlsDisabled ? undefined : (nextFps) => setFps(Number.isFinite(nextFps) ? nextFps : fps)}
-          onFrameCountChange={animationControlsDisabled ? undefined : (nextFrameCount) => setFrameCount(clampFrameCount(nextFrameCount))}
-          onEasingChange={animationControlsDisabled ? undefined : (nextEasing) => setEasing(nextEasing as keyof typeof easings)}
+          onFpsChange={animationControlsDisabled ? undefined : handleFpsChange}
+          onFrameCountChange={animationControlsDisabled ? undefined : handleFrameCountChange}
+          onEasingChange={animationControlsDisabled ? undefined : handleEasingChange}
           keyframePoseMap={keyframePoseMap}
           onSavePoseToFrame={animationControlsDisabled ? undefined : handleSavePoseToFrame}
           onApplyPoseToFrame={animationControlsDisabled ? undefined : handleApplyPoseLibraryToFrame}
@@ -1392,6 +1989,8 @@ const App: React.FC = () => {
           onRemovePoseAtFrame={animationControlsDisabled ? undefined : handleRemovePoseAtFrame}
           segmentInterpolationFrames={interpolationFramesBySegment}
           onSetSegmentInterpolation={animationControlsDisabled ? undefined : handleSetSegmentInterpolation}
+          segmentIkTweenMap={segmentIkTweenMap}
+          onPatchSegmentIkTween={animationControlsDisabled ? undefined : handlePatchSegmentIkTween}
         />
       </div>
 

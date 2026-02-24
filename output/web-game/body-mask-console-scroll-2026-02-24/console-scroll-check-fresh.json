@@ -1,0 +1,16 @@
+{
+  "before": {
+    "found": true,
+    "className": "px-2.5 py-2.5 flex-1 min-h-0 overflow-y-auto custom-scrollbar flex flex-col gap-2.5",
+    "scrollTop": 0,
+    "scrollHeight": 1919,
+    "clientHeight": 557
+  },
+  "after": {
+    "found": true,
+    "className": "px-2.5 py-2.5 flex-1 min-h-0 overflow-y-auto custom-scrollbar flex flex-col gap-2.5",
+    "scrollTop": 772,
+    "scrollHeight": 1919,
+    "clientHeight": 557
+  }
+}

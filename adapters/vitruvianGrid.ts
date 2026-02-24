@@ -114,7 +114,82 @@ export type VitruvianGridOptions = {
   navelRatio?: number;
 };
 
+export type VitruvianViewportInput = {
+  viewWindow: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  };
+  gridOnlyMode?: boolean;
+  referenceHeelY?: number | null;
+  modelBounds?: {
+    width: number;
+    height: number;
+  };
+};
+
+export type VitruvianHeadGridCellSample = {
+  label: string;
+  tileX: number;
+  tileY: number;
+  cellX: number;
+  cellY: number;
+  lineAxis: "x" | "y" | "xy" | "none";
+  worldX: number;
+  worldY: number;
+  localX: number;
+  localY: number;
+};
+
+export type VitruvianRuntimeGeometry = {
+  model: VitruvianGridModel;
+  plot: VitruvianPlotPayload;
+  viewWindow: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  };
+  center: NormalizedPoint;
+  plotWidth: number;
+  plotHeight: number;
+  plotMinX: number;
+  plotMinY: number;
+  plotMaxX: number;
+  plotMaxY: number;
+  gridTileHeight: number;
+  headUnit: number;
+  ringStepWorld: number;
+  ringVerticalOffsetWorld: number;
+  circleDiameter: number;
+  circleVerticalBuffer: number;
+  gridScale: number;
+  headGridSquarePx: number;
+  modelBounds: {
+    width: number;
+    height: number;
+  };
+  modelScale: number;
+  modelYOffset: number;
+  xOffset: number;
+  yOffset: number;
+  gridGroundScreenY: number;
+  worldToScreen: (worldX: number, worldY: number) => NormalizedPoint;
+  screenToWorld: (screenX: number, screenY: number) => NormalizedPoint;
+  projectModelPoint: (worldX: number, worldY: number) => NormalizedPoint;
+  unprojectModelPoint: (screenX: number, screenY: number) => NormalizedPoint;
+  resolveHeadGridCell: (screenX: number, screenY: number) => VitruvianHeadGridCellSample;
+};
+
+export const HEAD_PIECE_MODEL_BOUNDS = {
+  width: 52.8,
+  height: 54,
+};
+
 const round = (value: number): number => Number(value.toFixed(7));
+const clamp = (value: number, min: number, max: number): number =>
+  Math.max(min, Math.min(max, value));
 
 const createLineSeries = (totalHeight: number, divisions: number): number[] => {
   const unit = totalHeight / divisions;
@@ -333,5 +408,136 @@ export const createVitruvianPlotPayload = (
       minY,
       maxY: Math.max(maxY, circle.center.y + circle.radius),
     },
+  };
+};
+
+const DEFAULT_VITRUVIAN_MODEL = createVitruvianGridModel({ totalHeight: 1 });
+const DEFAULT_VITRUVIAN_PLOT = createVitruvianPlotPayload(DEFAULT_VITRUVIAN_MODEL);
+
+export const createVitruvianRuntimeGeometry = (
+  input: VitruvianViewportInput
+): VitruvianRuntimeGeometry => {
+  const { viewWindow, gridOnlyMode = false, referenceHeelY = null } = input;
+  const modelBounds = input.modelBounds ?? HEAD_PIECE_MODEL_BOUNDS;
+  const model = DEFAULT_VITRUVIAN_MODEL;
+  const plot = DEFAULT_VITRUVIAN_PLOT;
+
+  const plotWidth = plot.bounds.maxX - plot.bounds.minX;
+  const plotHeight = plot.bounds.maxY - plot.bounds.minY;
+  const plotMinX = plot.bounds.minX;
+  const plotMinY = plot.bounds.minY;
+  const plotMaxX = plot.bounds.maxX;
+  const plotMaxY = plot.bounds.maxY;
+  const gridTileHeight = model.square.height;
+  const headUnit = model.modules.head.unit;
+  const ringStepWorld = model.modules.head.unit;
+  const ringVerticalOffsetWorld = model.modules.finger.unit * 0.5;
+  const circleDiameter = model.circle.diameter;
+  const circleVerticalBuffer = headUnit * 0.5;
+  const gridScale = Math.min(
+    viewWindow.width / plotWidth,
+    viewWindow.height / (circleDiameter + circleVerticalBuffer * 2)
+  );
+  const headGridSquarePx = headUnit * gridScale;
+  const modelScale = gridOnlyMode
+    ? headGridSquarePx / Math.max(modelBounds.width, modelBounds.height)
+    : 1;
+  const center = {
+    x: viewWindow.x + viewWindow.width / 2,
+    y: viewWindow.y + viewWindow.height / 2,
+  };
+  const xOffset = center.x - (model.circle.center.x - plotMinX) * gridScale;
+  const yOffset = gridOnlyMode
+    ? 0
+    : (model.circle.center.y - plotMinY) * gridScale - viewWindow.height / 2 + viewWindow.y;
+  const gridGroundScreenY = viewWindow.y + viewWindow.height + yOffset;
+  const hasReferenceHeel = Number.isFinite(referenceHeelY as number);
+  const referenceHeelProjectedY = hasReferenceHeel
+    ? center.y + ((referenceHeelY as number) - center.y) * modelScale
+    : 0;
+  const modelYOffset = gridOnlyMode && hasReferenceHeel
+    ? gridGroundScreenY - referenceHeelProjectedY
+    : 0;
+
+  const worldToScreen = (worldX: number, worldY: number): NormalizedPoint => ({
+    x: (worldX - plotMinX) * gridScale + xOffset,
+    y: viewWindow.y + viewWindow.height - (worldY - plotMinY) * gridScale + yOffset,
+  });
+
+  const screenToWorld = (screenX: number, screenY: number): NormalizedPoint => ({
+    x: (screenX - xOffset) / gridScale + plotMinX,
+    y: plotMinY + (viewWindow.y + viewWindow.height + yOffset - screenY) / gridScale,
+  });
+
+  const projectModelPoint = (worldX: number, worldY: number): NormalizedPoint => ({
+    x: center.x + (worldX - center.x) * modelScale,
+    y: center.y + (worldY - center.y) * modelScale + modelYOffset,
+  });
+
+  const unprojectModelPoint = (screenX: number, screenY: number): NormalizedPoint => ({
+    x: center.x + (screenX - center.x) / modelScale,
+    y: center.y + (screenY - center.y - modelYOffset) / modelScale,
+  });
+
+  const resolveHeadGridCell = (screenX: number, screenY: number): VitruvianHeadGridCellSample => {
+    const { x: worldX, y: worldY } = screenToWorld(screenX, screenY);
+    const tileX = Math.floor((worldX - plotMinX) / plotWidth);
+    const tileY = Math.floor((worldY - plotMinY) / gridTileHeight);
+    const localX = worldX - (plotMinX + tileX * plotWidth);
+    const localY = worldY - (plotMinY + tileY * gridTileHeight);
+    const cellX = clamp(Math.floor(localX / headUnit), 0, 7);
+    const rowFromGround = clamp(Math.floor(localY / headUnit), 0, 7);
+    const cellY = 7 - rowFromGround;
+    const nearestLineX = Math.round(localX / headUnit) * headUnit;
+    const nearestLineY = Math.round(localY / headUnit) * headUnit;
+    const lineX = Math.abs(localX - nearestLineX) * gridScale <= 6;
+    const lineY = Math.abs(localY - nearestLineY) * gridScale <= 6;
+    const lineAxis: "x" | "y" | "xy" | "none" =
+      lineX && lineY ? "xy" : lineX ? "x" : lineY ? "y" : "none";
+    const lineSuffix = lineAxis === "none" ? "" : ` • ${lineAxis.toUpperCase()} line`;
+    return {
+      label: `Head Grid T(${tileX},${tileY}) C(${cellX},${cellY})${lineSuffix}`,
+      tileX,
+      tileY,
+      cellX,
+      cellY,
+      lineAxis,
+      worldX,
+      worldY,
+      localX,
+      localY,
+    };
+  };
+
+  return {
+    model,
+    plot,
+    viewWindow,
+    center,
+    plotWidth,
+    plotHeight,
+    plotMinX,
+    plotMinY,
+    plotMaxX,
+    plotMaxY,
+    gridTileHeight,
+    headUnit,
+    ringStepWorld,
+    ringVerticalOffsetWorld,
+    circleDiameter,
+    circleVerticalBuffer,
+    gridScale,
+    headGridSquarePx,
+    modelBounds,
+    modelScale,
+    modelYOffset,
+    xOffset,
+    yOffset,
+    gridGroundScreenY,
+    worldToScreen,
+    screenToWorld,
+    projectModelPoint,
+    unprojectModelPoint,
+    resolveHeadGridCell,
   };
 };
