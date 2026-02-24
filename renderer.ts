@@ -44,6 +44,14 @@ export interface BodyPartMaskLayer {
   filter?: string;
 }
 
+export interface DefaultPieceConfig {
+  visible?: boolean;
+  scale?: number;
+  offsetX?: number;
+  offsetY?: number;
+  rotationDeg?: number;
+}
+
 const DEFAULT_VISUAL_MODULE_STATE: VisualModuleState = {
   headGrid: true,
   fingerGrid: true,
@@ -75,6 +83,7 @@ interface RenderOptions {
   runtimeGeometry?: VitruvianRuntimeGeometry;
   showIkDebugOverlay?: boolean;
   headGridHover?: { label: string; x: number; y: number; occludedByModel: boolean } | null;
+  defaultPieceConfigs?: Record<string, DefaultPieceConfig>;
 }
 
 const layerImageCache: Record<string, HTMLImageElement> = {};
@@ -91,7 +100,7 @@ const clampPercent = (value: number): number => {
 
 const clampScalePercent = (value: number): number => {
   if (!Number.isFinite(value)) return 100;
-  return Math.max(10, Math.min(400, value));
+  return Math.max(1, Math.min(2000, value));
 };
 
 const resolveLayerImage = (src: string): HTMLImageElement | null => {
@@ -446,19 +455,42 @@ export const render = (options: RenderOptions) => {
         const shape = bitruviusData.SHAPES[id];
         if (!shape || shape.type === "none") return;
         const pos = posMap[id];
+        const pieceConfig = defaultPieceConfigs?.[id];
+        const pieceVisible = pieceConfig?.visible ?? true;
+        if (!pieceVisible) {
+          return;
+        }
         const t = computeWorld(id, rots, center);
         ctx.save();
         if (isShadow && drawShadows) {
           ctx.translate(pos.x + SHADOW_OFFSET.x, pos.y + SHADOW_OFFSET.y);
           ctx.fillStyle = SHADOW_COLOR;
           ctx.strokeStyle = "transparent";
+          ctx.rotate(d2r(t.angle));
+          ctx.scale(modelScale, modelScale);
         } else {
+          const pieceConfig = defaultPieceConfigs?.[id];
+          const pieceVisible = pieceConfig?.visible ?? true;
+          if (!pieceVisible) {
+            ctx.restore();
+            return;
+          }
+          const pieceRotationRad = d2r(pieceConfig?.rotationDeg ?? 0);
+          const pieceScale = Math.max(0.05, Math.min(4, pieceConfig?.scale ?? 1));
+          const combinedScale = modelScale * pieceScale;
+          const offsetX = Number.isFinite(pieceConfig?.offsetX) ? pieceConfig.offsetX : 0;
+          const offsetY = Number.isFinite(pieceConfig?.offsetY) ? pieceConfig.offsetY : 0;
+
           ctx.translate(pos.x, pos.y);
           ctx.fillStyle = fillColor ?? (silhouetteActive ? (lotteMode ? lotteFill : "#000000") : bitruviusData.JOINT_DEFS[id].color);
           ctx.strokeStyle = strokeColor ?? (silhouetteActive ? (lotteMode ? lotteEdge : "#000000") : "rgba(0,0,0,0.5)");
+          ctx.rotate(d2r(t.angle) + pieceRotationRad);
+          ctx.scale(combinedScale, combinedScale);
+          if (offsetX || offsetY) {
+            const safeScale = Math.max(Math.abs(combinedScale), 1e-6);
+            ctx.translate(offsetX / safeScale, offsetY / safeScale);
+          }
         }
-        ctx.rotate(d2r(t.angle));
-        ctx.scale(modelScale, modelScale);
         ctx.beginPath();
         drawShapePath(shape, { useShapeWaistRadius: true });
         ctx.fill();

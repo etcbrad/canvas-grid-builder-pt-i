@@ -585,10 +585,13 @@ Original prompt: add the model to the grid.The head piece should fit exactly in 
 - Validation:
   - `npm test` passes (4 files, 21 tests).
   - `npm run build` passes.
-  - Playwright skill-client run (escalated Chromium launch) succeeded:
-    - screenshot: `output/web-game/fk-live-pose-constraints-off-2026-02-24/shot-0.png`
-    - state: `output/web-game/fk-live-pose-constraints-off-2026-02-24/state-0.json`
-    - no `errors-*.json` artifact emitted.
+- Playwright skill-client run (escalated Chromium launch) succeeded:
+  - screenshot: `output/web-game/fk-live-pose-constraints-off-2026-02-24/shot-0.png`
+  - state: `output/web-game/fk-live-pose-constraints-off-2026-02-24/state-0.json`
+  - no `errors-*.json` artifact emitted.
+
+- Added auto-crop for body-mask uploads, expanded background/foreground scale controls with huge-range sliders, and replaced the refine popup with a left-side posing console that mirrors the animation rail while keeping the top button row on the portal.
+- Validation: `npm run build`, `npm run test -- --run`; Playwright skill-client run blocked by `node` complaining `Cannot use import statement outside a module` when loading `$WEB_GAME_CLIENT`.
 
 - Simplified grid/ring/model coupling to a single live runtime geometry contract (root app only; no timeline save-flow changes):
   - Added new adapter API in `adapters/vitruvianGrid.ts`:
@@ -773,3 +776,8 @@ Original prompt: add the model to the grid.The head piece should fit exactly in 
   - DOM overlap probe after patch: 17 handles, 0 overlapping pairs.
   - Artifact: `output/web-game/mask-overlap-after-v2.png`.
   - `npm run build` passes.
+- Built the up-to-date grids, rings, ground plane, and figure surfaces by running the production build.
+- Validation:
+  - `npm test` passes (6 files, 31 tests).
+  - `npm run build` passes.
+  - Playwright skill-client attempt (`node "$CODEX_HOME/skills/develop-web-game/scripts/web_game_playwright_client.js" --url http://127.0.0.1:5173 --actions-file ...`) is blocked by Node refusing to treat the skill script as an ES module: `/Users/bradleygeiser/package.json` is `type: "commonjs"`, so the interpreter stops with `SyntaxError: Cannot use import statement outside a module` before any screenshots/state artifacts can be written.

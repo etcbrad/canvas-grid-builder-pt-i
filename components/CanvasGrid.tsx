@@ -3,7 +3,14 @@ import { r2d, normA, clamp } from '../utils';
 import { BitruviusData, IKActivationStage, IKChain, SkeletonRotations, WorldCoords } from '../modelData';
 import { computeJointWorldForPose } from '../fkEngine';
 import { solveIK_AdvancedWithResult } from '../ikSolver';
-import { render, type BodyPartMaskLayer, type GhostFrameRender, type ImageLayerState, type VisualModuleState } from '../renderer';
+import {
+  render,
+  type BodyPartMaskLayer,
+  type DefaultPieceConfig,
+  type GhostFrameRender,
+  type ImageLayerState,
+  type VisualModuleState,
+} from '../renderer';
 import { createVitruvianRuntimeGeometry } from '../adapters/vitruvianGrid';
 import { applyHumanAssist } from '../ikHumanAssist';
 import { type JumpAssistState, type LegIntentMode, type PoseDirection, type PostureState, resolveLegIntent } from '../ikLegIntent';
@@ -99,6 +106,9 @@ interface CanvasGridProps {
   onPatchBackgroundImageLayer?: (patch: Partial<ImageLayerState>) => void;
   onPatchForegroundImageLayer?: (patch: Partial<ImageLayerState>) => void;
   onPatchBodyPartMaskLayer?: (jointId: string, patch: Partial<BodyPartMaskLayer>) => void;
+  defaultPieceConfigs?: Record<string, DefaultPieceConfig>;
+  onPatchDefaultPieceConfig?: (jointId: string, patch: Partial<DefaultPieceConfig>) => void;
+  onClearDefaultPieceConfig?: (jointId: string) => void;
   gridOnlyMode?: boolean;
   onExitGridView?: () => void;
   isPlaying?: boolean;
@@ -181,6 +191,9 @@ const DEFAULT_BODY_PART_MASK_LAYER: BodyPartMaskLayer = {
 };
 
 const BODY_PART_MASK_SCALE_MIN = 25;
+const DEFAULT_PIECE_SCALE_MIN = 0.2;
+const DEFAULT_PIECE_SCALE_MAX = 3;
+const DEFAULT_PIECE_OFFSET_LIMIT = 120;
 const CONSOLE_PANEL_BACKGROUND = 'rgba(18, 16, 24, 0.5)';
 
 const IMAGE_FIT_MODE_OPTIONS: Array<{ value: NonNullable<ImageLayerState['fitMode']>; label: string }> = [
@@ -265,6 +278,24 @@ const IK_ROTATION_BLEND_ALPHA = scaleIkAlphaForSpeed(0.46);
 const IK_ROTATION_BLEND_ALPHA_LOW_FRICTION = scaleIkAlphaForSpeed(0.26);
 const IK_ROTATION_STEP_MAX = 7.5 * IK_SPEED_MULTIPLIER;
 const IK_ROTATION_STEP_MAX_LOW_FRICTION = 4.2 * IK_SPEED_MULTIPLIER;
+const IMAGE_SCALE_SLIDER_MIN = 1;
+const IMAGE_SCALE_SLIDER_MAX = 100;
+const IMAGE_SCALE_MIN = 1;
+const IMAGE_SCALE_MAX = 1000;
+
+const scaleSliderToActual = (sliderValue: number) => {
+  const sliderRange = IMAGE_SCALE_SLIDER_MAX - IMAGE_SCALE_SLIDER_MIN;
+  const scaleRange = IMAGE_SCALE_MAX - IMAGE_SCALE_MIN;
+  const normalized = sliderRange > 0 ? (sliderValue - IMAGE_SCALE_SLIDER_MIN) / sliderRange : 0;
+  return Math.round(normalized * scaleRange + IMAGE_SCALE_MIN);
+};
+
+const actualScaleToSlider = (scale: number) => {
+  const sliderRange = IMAGE_SCALE_SLIDER_MAX - IMAGE_SCALE_SLIDER_MIN;
+  const scaleRange = IMAGE_SCALE_MAX - IMAGE_SCALE_MIN;
+  const normalized = scaleRange > 0 ? (scale - IMAGE_SCALE_MIN) / scaleRange : 0;
+  return Math.round(normalized * sliderRange + IMAGE_SCALE_SLIDER_MIN);
+};
 const IK_ROTATION_APPLY_EPSILON_DEG = 0.03;
 const FK_ROTATION_NOISE_EPSILON_DEG = 0.04;
 const FK_ROTATION_APPLY_EPSILON_DEG = 0.03;
@@ -636,6 +667,9 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
   onPatchBackgroundImageLayer,
   onPatchForegroundImageLayer,
   onPatchBodyPartMaskLayer,
+  defaultPieceConfigs,
+  onPatchDefaultPieceConfig,
+  onClearDefaultPieceConfig,
   gridOnlyMode = false,
   onExitGridView,
   isPlaying = false,
@@ -738,6 +772,7 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
   const [timelinePanelMode, setTimelinePanelMode] = useState<'basic' | 'advanced'>('basic');
   const [timelineMinimized, setTimelineMinimized] = useState(false);
   const [timelineControlsMinimized, setTimelineControlsMinimized] = useState(false);
+  const [posingConsoleMinimized, setPosingConsoleMinimized] = useState(false);
   const [timelineScrollIndex, setTimelineScrollIndex] = useState(0);
   const [timelineStepFrames, setTimelineStepFrames] = useState(1);
   const [timelineManualStepMode, setTimelineManualStepMode] = useState(false);
@@ -747,6 +782,7 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
   const [activeMaskUploadJointId, setActiveMaskUploadJointId] = useState<string | null>(null);
   const [activeMaskEditorJointId, setActiveMaskEditorJointId] = useState<string | null>(null);
   const [refinePanelMode, setRefinePanelMode] = useState<'basic' | 'advanced'>('basic');
+  const [activeDefaultPieceId, setActiveDefaultPieceId] = useState<string | null>(null);
   const [showIkAdvancedControls, setShowIkAdvancedControls] = useState(false);
   const [fkBendOffsetByJoint, setFkBendOffsetByJoint] = useState<Record<string, number>>({});
   const [fkStretchOffsetByJoint, setFkStretchOffsetByJoint] = useState<Record<string, number>>({});
@@ -864,6 +900,7 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
       return Boolean(shape && shape.type !== 'none');
     });
   }, [bitruviusData.RENDER_ORDER, bitruviusData.SHAPES]);
+  const defaultPieceIds = React.useMemo(() => maskableBodyPartIds, [maskableBodyPartIds]);
   
   // Requirement: List activated at start
   const [isMenuOpen, setIsMenuOpen] = useState(true);
@@ -2169,8 +2206,12 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
   const bgYPercent = Math.round(clamp(Number.isFinite(resolvedBackgroundLayer.y) ? resolvedBackgroundLayer.y : 50, 0, 100));
   const fgXPercent = Math.round(clamp(Number.isFinite(resolvedForegroundLayer.x) ? resolvedForegroundLayer.x : 50, 0, 100));
   const fgYPercent = Math.round(clamp(Number.isFinite(resolvedForegroundLayer.y) ? resolvedForegroundLayer.y : 50, 0, 100));
-  const bgScalePercent = Math.round(clamp(Number.isFinite(resolvedBackgroundLayer.scale) ? resolvedBackgroundLayer.scale : 100, 10, 400));
-  const fgScalePercent = Math.round(clamp(Number.isFinite(resolvedForegroundLayer.scale) ? resolvedForegroundLayer.scale : 100, 10, 400));
+  const resolvedBgScale = clamp(Number.isFinite(resolvedBackgroundLayer.scale) ? resolvedBackgroundLayer.scale : 100, IMAGE_SCALE_MIN, IMAGE_SCALE_MAX);
+  const bgScaleSlider = actualScaleToSlider(resolvedBgScale);
+  const bgScaleDisplay = Math.round(resolvedBgScale);
+  const resolvedFgScale = clamp(Number.isFinite(resolvedForegroundLayer.scale) ? resolvedForegroundLayer.scale : 100, IMAGE_SCALE_MIN, IMAGE_SCALE_MAX);
+  const fgScaleSlider = actualScaleToSlider(resolvedFgScale);
+  const fgScaleDisplay = Math.round(resolvedFgScale);
   const bgFitMode = resolvedBackgroundLayer.fitMode ?? 'free';
   const fgFitMode = resolvedForegroundLayer.fitMode ?? 'free';
   const fgBlendMode = resolvedForegroundLayer.blendMode ?? 'source-over';
@@ -2221,6 +2262,41 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
     }
     onPatchBodyPartMaskLayer?.(activeMaskEditorJointId, patch);
   }, [activeMaskEditorJointId, onPatchBodyPartMaskLayer]);
+  const activeDefaultPieceLabel = activeDefaultPieceId
+    ? bitruviusData.JOINT_DEFS[activeDefaultPieceId]?.label ?? activeDefaultPieceId
+    : '';
+  const activeDefaultPieceConfig = activeDefaultPieceId ? defaultPieceConfigs?.[activeDefaultPieceId] : undefined;
+  const activeDefaultPieceVisible = activeDefaultPieceConfig?.visible ?? true;
+  const activeDefaultPieceScale = clamp(
+    Number.isFinite(activeDefaultPieceConfig?.scale) ? activeDefaultPieceConfig.scale : 1,
+    DEFAULT_PIECE_SCALE_MIN,
+    DEFAULT_PIECE_SCALE_MAX
+  );
+  const activeDefaultPieceRotation = clamp(
+    Number.isFinite(activeDefaultPieceConfig?.rotationDeg) ? activeDefaultPieceConfig.rotationDeg : 0,
+    -180,
+    180
+  );
+  const activeDefaultPieceOffsetX = clamp(
+    Number.isFinite(activeDefaultPieceConfig?.offsetX) ? activeDefaultPieceConfig.offsetX : 0,
+    -DEFAULT_PIECE_OFFSET_LIMIT,
+    DEFAULT_PIECE_OFFSET_LIMIT
+  );
+  const activeDefaultPieceOffsetY = clamp(
+    Number.isFinite(activeDefaultPieceConfig?.offsetY) ? activeDefaultPieceConfig.offsetY : 0,
+    -DEFAULT_PIECE_OFFSET_LIMIT,
+    DEFAULT_PIECE_OFFSET_LIMIT
+  );
+  const patchActiveDefaultPiece = useCallback((patch: Partial<DefaultPieceConfig>) => {
+    if (!activeDefaultPieceId) {
+      return;
+    }
+    onPatchDefaultPieceConfig?.(activeDefaultPieceId, patch);
+  }, [activeDefaultPieceId, onPatchDefaultPieceConfig]);
+  const closeOverlay = useCallback(() => {
+    setActiveMaskEditorJointId(null);
+    setActiveDefaultPieceId(null);
+  }, []);
   const bodyMaskUploadHandles = React.useMemo(() => {
     if (!gridOnlyMode || !bodyMasksEnabled || !maskableBodyPartIds.length) {
       return [] as Array<{
@@ -2579,7 +2655,14 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
                     {isPlaying ? 'Pause' : 'Play'}
                   </button>
                   <div className="min-h-8 px-2 py-1.5 text-[11px] border border-white/10 rounded text-zinc-300 text-center tracking-[0.04em] uppercase">
-                    Frame {currentDisplayFrame}/{totalDisplayFrames}
+                    <div className="flex items-center justify-center gap-2">
+                      <span className="flex h-6 w-6 items-center justify-center rounded-full border border-white/15 bg-zinc-950 text-[12px] font-semibold text-zinc-100">
+                        {currentDisplayFrame}
+                      </span>
+                      <span className="text-[10px] uppercase tracking-[0.05em] text-zinc-400">
+                        of {totalDisplayFrames}
+                      </span>
+                    </div>
                   </div>
                   <button
                     type="button"
@@ -2790,19 +2873,24 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
                             />
                           </label>
                           <label className="space-y-1">
-                            <span className="text-[9px] tracking-[0.05em] uppercase text-zinc-400">Scale</span>
+                            <div className="flex items-center justify-between text-[9px] tracking-[0.05em] uppercase text-zinc-400">
+                              <span>Scale</span>
+                              <span>{bgScaleDisplay}</span>
+                            </div>
                             <input
-                              type="number"
-                              min={10}
-                              max={400}
-                              value={bgScalePercent}
+                              type="range"
+                              min={IMAGE_SCALE_SLIDER_MIN}
+                              max={IMAGE_SCALE_SLIDER_MAX}
+                              value={bgScaleSlider}
                               disabled={!onPatchBackgroundImageLayer}
-                              onChange={(event) =>
+                              onChange={(event) => {
+                                const next = Number(event.target.value);
+                                if (!Number.isFinite(next)) return;
                                 onPatchBackgroundImageLayer?.({
-                                  scale: clamp(Number(event.target.value), 10, 400),
-                                })
-                              }
-                              className="w-full min-h-8 bg-zinc-950/75 border border-zinc-800 rounded px-2 py-1 text-[10px] text-zinc-300 disabled:opacity-45 disabled:cursor-not-allowed"
+                                  scale: clamp(scaleSliderToActual(next), IMAGE_SCALE_MIN, IMAGE_SCALE_MAX),
+                                });
+                              }}
+                              className="w-full accent-emerald-400 disabled:opacity-45 disabled:cursor-not-allowed"
                             />
                           </label>
                         </div>
@@ -2931,19 +3019,24 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
                             />
                           </label>
                           <label className="space-y-1">
-                            <span className="text-[9px] tracking-[0.05em] uppercase text-zinc-400">Scale</span>
+                            <div className="flex items-center justify-between text-[9px] tracking-[0.05em] uppercase text-zinc-400">
+                              <span>Scale</span>
+                              <span>{fgScaleDisplay}</span>
+                            </div>
                             <input
-                              type="number"
-                              min={10}
-                              max={400}
-                              value={fgScalePercent}
+                              type="range"
+                              min={IMAGE_SCALE_SLIDER_MIN}
+                              max={IMAGE_SCALE_SLIDER_MAX}
+                              value={fgScaleSlider}
                               disabled={!onPatchForegroundImageLayer}
-                              onChange={(event) =>
+                              onChange={(event) => {
+                                const next = Number(event.target.value);
+                                if (!Number.isFinite(next)) return;
                                 onPatchForegroundImageLayer?.({
-                                  scale: clamp(Number(event.target.value), 10, 400),
-                                })
-                              }
-                              className="w-full min-h-8 bg-zinc-950/75 border border-zinc-800 rounded px-2 py-1 text-[10px] text-zinc-300 disabled:opacity-45 disabled:cursor-not-allowed"
+                                  scale: clamp(scaleSliderToActual(next), IMAGE_SCALE_MIN, IMAGE_SCALE_MAX),
+                                });
+                              }}
+                              className="w-full accent-emerald-400 disabled:opacity-45 disabled:cursor-not-allowed"
                             />
                           </label>
                         </div>
@@ -2976,30 +3069,69 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
                         <div className="text-[10px] text-zinc-400 leading-snug">
                           Use on-canvas <span className="text-zinc-200 font-semibold">+</span> handles around the ring to select a body part and open the mask editor.
                         </div>
-                        <div className="grid grid-cols-2 gap-1.5">
-                          <button
-                            type="button"
-                            onClick={() => {
-                              if (!maskableBodyPartIds.length) return;
-                              const fallbackJointId = maskableBodyPartIds[0];
-                              setActiveMaskEditorJointId(fallbackJointId);
-                            }}
-                            className="min-h-8 px-2 py-1 text-[10px] border border-white/15 rounded text-zinc-200 hover:bg-white/10 transition-colors"
-                          >
-                            Open Editor
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setBodyMasksEnabled((prev) => !prev)}
-                            className="min-h-8 px-2 py-1 text-[10px] border border-white/15 rounded text-zinc-200 hover:bg-white/10 transition-colors"
-                          >
-                            Masks {bodyMasksEnabled ? 'On' : 'Off'}
-                          </button>
-                        </div>
+                      <div className="grid grid-cols-2 gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (!maskableBodyPartIds.length) return;
+                            const fallbackJointId = maskableBodyPartIds[0];
+                            setActiveMaskEditorJointId(fallbackJointId);
+                          }}
+                          className="min-h-8 px-2 py-1 text-[10px] border border-white/15 rounded text-zinc-200 hover:bg-white/10 transition-colors"
+                        >
+                          Open Editor
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setBodyMasksEnabled((prev) => !prev)}
+                          className="min-h-8 px-2 py-1 text-[10px] border border-white/15 rounded text-zinc-200 hover:bg-white/10 transition-colors"
+                        >
+                          Masks {bodyMasksEnabled ? 'On' : 'Off'}
+                        </button>
                       </div>
                     </div>
+                    <div className="space-y-1.5 border border-white/10 rounded p-2">
+                      <div className="flex items-center justify-between text-[10px] tracking-[0.08em] uppercase text-zinc-300">
+                        <span>Default Pieces</span>
+                        <span className="text-zinc-500">{defaultPieceIds.length}</span>
+                      </div>
+                      <div className="max-h-44 overflow-y-auto custom-scrollbar space-y-1">
+                        {defaultPieceIds.map((jointId) => {
+                          const label = bitruviusData.JOINT_DEFS[jointId]?.label ?? jointId;
+                          const config = defaultPieceConfigs?.[jointId];
+                          const visible = config?.visible ?? true;
+                          return (
+                            <div key={`piece-${jointId}`} className="flex items-center justify-between gap-2 text-[10px]">
+                              <span className="truncate text-zinc-100" title={label}>{label}</span>
+                              <div className="flex items-center gap-1">
+                                <button
+                                  type="button"
+                                  onClick={() => onPatchDefaultPieceConfig?.(jointId, { visible: !visible })}
+                                  className="min-h-7 px-2 py-1 text-[9px] border border-white/15 rounded text-zinc-200 hover:bg-white/10 transition-colors disabled:opacity-45 disabled:cursor-not-allowed"
+                                  disabled={!onPatchDefaultPieceConfig}
+                                >
+                                  {visible ? 'Hide' : 'Show'}
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setActiveDefaultPieceId(jointId);
+                                    setActiveMaskEditorJointId(null);
+                                  }}
+                                  className="min-h-7 px-2 py-1 text-[9px] border border-white/15 rounded text-zinc-200 hover:bg-white/10 transition-colors"
+                                  title={`Edit ${label}`}
+                                >
+                                  Edit
+                                </button>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  </div>
 
-                    <div className="grid grid-cols-2 gap-1.5 border border-white/10 rounded p-2">
+                  <div className="grid grid-cols-2 gap-1.5 border border-white/10 rounded p-2">
                       <button
                         type="button"
                         onClick={() => setTimelineScrollIndex((prev) => clamp(prev - 1, 0, maxTimelineScrollIndex))}
@@ -3132,9 +3264,11 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
 
                     return (
                       <div key={`slot-${frame}-${slotIndex}`} className="space-y-1.5 border border-white/10 rounded p-1.5">
-                        <div className="flex items-center justify-between text-[10px] tracking-[0.05em] uppercase text-zinc-300">
-                          <span>Frame {displayFrame}</span>
-                          <span className="text-zinc-500">{hasPose ? 'Key Pose' : 'Empty'}</span>
+                        <div className="flex items-center justify-between">
+                          <span className="flex h-6 w-6 items-center justify-center rounded-full border border-white/15 bg-zinc-950 text-[10px] font-semibold text-zinc-100">
+                            {displayFrame}
+                          </span>
+                          <span className="text-[10px] tracking-[0.05em] uppercase text-zinc-500">{hasPose ? 'Key Pose' : 'Empty'}</span>
                         </div>
 
                         <div className="flex items-center gap-1.5">
@@ -3495,9 +3629,9 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
                   >
                     Back to 1
                   </button>
-                  <div className="text-[10px] text-zinc-400 tracking-[0.05em] uppercase">Motion Function</div>
-                  <div className="grid grid-cols-4 gap-1.5">
-                    {timelineFunctionPresets.map((preset) => {
+                <div className="text-[10px] text-zinc-400 tracking-[0.05em] uppercase">Motion Function</div>
+                  <div className="flex overflow-hidden rounded border border-white/10 bg-zinc-950">
+                    {timelineFunctionPresets.map((preset, index) => {
                       const active = preset.id === activeTimelineFunctionId;
                       return (
                         <button
@@ -3505,9 +3639,10 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
                           type="button"
                           onClick={() => onEasingChange?.(preset.easing)}
                           disabled={animationControlDisabled || !onEasingChange}
-                          className="min-h-8 px-1 py-1 text-[10px] border rounded transition-colors disabled:opacity-45 disabled:cursor-not-allowed"
+                          className={`flex-1 min-h-8 px-2 py-1 text-[10px] transition-colors disabled:opacity-45 disabled:cursor-not-allowed ${
+                            index < timelineFunctionPresets.length - 1 ? 'border-r border-white/10' : ''
+                          }`}
                           style={{
-                            borderColor: active ? 'rgba(74, 222, 128, 0.66)' : 'rgba(255, 255, 255, 0.15)',
                             background: active ? 'rgba(16, 88, 56, 0.34)' : 'transparent',
                             color: active ? 'rgba(236, 253, 245, 0.95)' : 'rgba(212, 212, 216, 0.92)',
                           }}
@@ -4700,6 +4835,11 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
                       Switch to Advanced for body-reaction toggles and solver internals.
                     </div>
                   )}
+                </div>
+              )}
+              {posingConsoleMinimized && (
+                <div className="px-2.5 py-2.5 flex-1 flex items-center justify-center text-[10px] text-zinc-400 tracking-[0.05em] uppercase">
+                  Posing controls hidden. Toggle Controls to show.
                 </div>
               )}
             </div>

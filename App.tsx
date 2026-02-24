@@ -15,7 +15,7 @@ import type { PoseKeyframe } from 'pose-to-pose-engine/types';
 import { createInterpolator } from './adapters/poseInterpolator';
 import * as easings from './easing';
 import type { EasingFn } from './easing';
-import type { BodyPartMaskLayer, ImageLayerState, VisualModuleState } from './renderer';
+import type { BodyPartMaskLayer, DefaultPieceConfig, ImageLayerState, VisualModuleState } from './renderer';
 import { computeWorldPoseForSkeleton } from './fkEngine';
 import {
   DEFAULT_SEGMENT_IK_TWEEN_SETTINGS,
@@ -68,6 +68,8 @@ const DEFAULT_BODY_PART_MASK_LAYER: BodyPartMaskLayer = {
   blendMode: 'source-over',
   filter: 'none',
 };
+const MASK_AUTO_CROP_ALPHA_THRESHOLD = 12;
+const MASK_AUTO_CROP_PADDING = 6;
 const CORE_MODULE_DEFINITIONS: CoreModuleDefinition[] = [
   {
     id: 'core_math',
@@ -628,20 +630,99 @@ const App: React.FC = () => {
     delete bodyPartMaskObjectUrlRef.current[jointId];
   }, []);
 
+  const autoCropMaskImage = useCallback(async (file: File): Promise<Blob | null> => {
+    if (typeof window === 'undefined' || typeof document === 'undefined' || typeof createImageBitmap !== 'function') {
+      return null;
+    }
+    let bitmap: ImageBitmap | null = null;
+    try {
+      bitmap = await createImageBitmap(file);
+      const width = bitmap.width;
+      const height = bitmap.height;
+      if (!width || !height) {
+        return null;
+      }
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        return null;
+      }
+      ctx.drawImage(bitmap, 0, 0);
+      const imageData = ctx.getImageData(0, 0, width, height);
+      const data = imageData.data;
+      let minX = width;
+      let minY = height;
+      let maxX = -1;
+      let maxY = -1;
+      const threshold = MASK_AUTO_CROP_ALPHA_THRESHOLD;
+      for (let y = 0, offset = 0; y < height; y += 1) {
+        for (let x = 0; x < width; x += 1, offset += 4) {
+          if (data[offset + 3] > threshold) {
+            if (x < minX) minX = x;
+            if (x > maxX) maxX = x;
+            if (y < minY) minY = y;
+            if (y > maxY) maxY = y;
+          }
+        }
+      }
+      if (maxX < minX || maxY < minY) {
+        return null;
+      }
+      const padding = MASK_AUTO_CROP_PADDING;
+      const cropMinX = Math.max(0, minX - padding);
+      const cropMinY = Math.max(0, minY - padding);
+      const cropMaxX = Math.min(width - 1, maxX + padding);
+      const cropMaxY = Math.min(height - 1, maxY + padding);
+      const cropWidth = cropMaxX - cropMinX + 1;
+      const cropHeight = cropMaxY - cropMinY + 1;
+      if (cropWidth >= width && cropHeight >= height) {
+        return null;
+      }
+      const cropCanvas = document.createElement('canvas');
+      cropCanvas.width = cropWidth;
+      cropCanvas.height = cropHeight;
+      const cropCtx = cropCanvas.getContext('2d');
+      if (!cropCtx) {
+        return null;
+      }
+      cropCtx.drawImage(bitmap, cropMinX, cropMinY, cropWidth, cropHeight, 0, 0, cropWidth, cropHeight);
+      const blob = await new Promise<Blob | null>((resolve) => cropCanvas.toBlob(resolve, 'image/png'));
+      return blob;
+    } catch (error) {
+      console.warn('Mask auto-crop failed', error);
+      return null;
+    } finally {
+      bitmap?.close();
+    }
+  }, []);
+
   const handleUploadBodyPartMaskLayer = useCallback((jointId: string, file: File) => {
-    const nextUrl = URL.createObjectURL(file);
-    clearBodyPartMaskObjectUrl(jointId);
-    bodyPartMaskObjectUrlRef.current[jointId] = nextUrl;
-    setBodyPartMaskLayers((prev) => ({
-      ...prev,
-      [jointId]: {
-        ...DEFAULT_BODY_PART_MASK_LAYER,
-        ...(prev[jointId] ?? {}),
-        src: nextUrl,
-        visible: true,
-      },
-    }));
-  }, [clearBodyPartMaskObjectUrl]);
+    void (async () => {
+      let uploadSource: File | Blob = file;
+      try {
+        const cropped = await autoCropMaskImage(file);
+        if (cropped) {
+          uploadSource = cropped;
+        }
+      } catch (error) {
+        console.warn('Mask auto-crop failed', error);
+      }
+      const nextUrl = URL.createObjectURL(uploadSource);
+      clearBodyPartMaskObjectUrl(jointId);
+      bodyPartMaskObjectUrlRef.current[jointId] = nextUrl;
+      setBodyPartMaskLayers((prev) => ({
+        ...prev,
+        [jointId]: {
+          ...DEFAULT_BODY_PART_MASK_LAYER,
+          ...(prev[jointId] ?? {}),
+          src: nextUrl,
+          visible: true,
+        },
+      }));
+    })();
+  }, [autoCropMaskImage, clearBodyPartMaskObjectUrl]);
 
   const handleClearBodyPartMaskLayer = useCallback((jointId: string) => {
     clearBodyPartMaskObjectUrl(jointId);
@@ -655,6 +736,41 @@ const App: React.FC = () => {
       },
     }));
   }, [clearBodyPartMaskObjectUrl]);
+
+  const [defaultPieceConfigs, setDefaultPieceConfigs] = useState<Record<string, DefaultPieceConfig>>({});
+
+  const handlePatchDefaultPieceConfig = useCallback((jointId: string, patch: Partial<DefaultPieceConfig>) => {
+    setDefaultPieceConfigs((prev) => {
+      const existing = prev[jointId] ?? {};
+      const next: DefaultPieceConfig = { ...existing };
+      Object.entries(patch).forEach(([key, value]) => {
+        if (value === undefined) {
+          delete (next as any)[key];
+        } else {
+          (next as any)[key] = value;
+        }
+      });
+      if (!Object.keys(next).length) {
+        const { [jointId]: removed, ...rest } = prev;
+        return rest;
+      }
+      return {
+        ...prev,
+        [jointId]: next,
+      };
+    });
+  }, []);
+
+  const handleClearDefaultPieceConfig = useCallback((jointId: string) => {
+    setDefaultPieceConfigs((prev) => {
+      if (!prev[jointId]) {
+        return prev;
+      }
+      const next = { ...prev };
+      delete next[jointId];
+      return next;
+    });
+  }, []);
 
   const handlePatchBodyPartMaskLayer = useCallback((jointId: string, patch: Partial<BodyPartMaskLayer>) => {
     setBodyPartMaskLayers((prev) => ({
@@ -1926,8 +2042,8 @@ const App: React.FC = () => {
       <div className="flex-1 w-full relative overflow-hidden flex items-center justify-center p-0">
         <CanvasGrid
           width={canvasWidth} height={canvasHeight}
-          majorGridSize={64} majorGridColor="rgba(128, 0, 128, 0.4)" majorGridWidth={1}
-          minorGridSize={8} minorGridColor="rgba(0, 255, 0, 0.2)" minorGridWidth={0.5}
+          majorGridSize={64} majorGridColor="rgba(128, 0, 128, 0.32)" majorGridWidth={1}
+          minorGridSize={8} minorGridColor="rgba(0, 255, 0, 0.16)" minorGridWidth={0.5}
           ruleOfThirdsColor="rgba(0, 0, 0, 0.6)" ruleOfThirdsWidth={1.5}
           bitruviusData={modelData}
           currentRotations={displayedRotations}
@@ -1963,6 +2079,9 @@ const App: React.FC = () => {
           onPatchBackgroundImageLayer={handlePatchBackgroundImageLayer}
           onPatchForegroundImageLayer={handlePatchForegroundImageLayer}
           onPatchBodyPartMaskLayer={handlePatchBodyPartMaskLayer}
+          defaultPieceConfigs={defaultPieceConfigs}
+          onPatchDefaultPieceConfig={handlePatchDefaultPieceConfig}
+          onClearDefaultPieceConfig={handleClearDefaultPieceConfig}
           gridOnlyMode={gridViewMode}
           isPlaying={isPlaying}
           onTogglePlayback={animationControlsDisabled ? undefined : () => setIsPlaying((prev) => !prev)}
