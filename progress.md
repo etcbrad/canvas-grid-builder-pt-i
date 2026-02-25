@@ -118,6 +118,11 @@ Original prompt: add the model to the grid.The head piece should fit exactly in 
   - Softer glass gradient panel.
   - Lower-contrast borders/buttons.
   - Less saturated slot backgrounds with subtle active frame accent.
+- Added timeline scrolling via mouse wheel over the frame-slot list in `components/CanvasGrid.tsx`:
+  - Wheel scroll advances `timelineScrollIndex` (Shift+wheel pages).
+  - Keeps the timeline panel itself stable (prevents wheel from scrolling the rail content).
+  - Playwright client extended to support wheel steps (`wheel_delta_x/y` + optional `wheel_selector`).
+- Validation: `npm test -- --run`, `npm run build`, and Playwright page screenshot check (`output/web-game/timeline-scroll-2026-02-25b`).
 - Fixed `CanvasGrid.tsx` runtime TDZ crash: moved `computeWorld` declaration before `computeThumbPosePath` so dependency capture does not access an uninitialized const.
 - Validation: `npm run build` passes.
 - Playwright skill smoke run against `http://localhost:3000` passed; screenshot captured at `output/web-game/post-computeWorld-order-fix-2026-02-23/shot-0.png` and no `errors-*.json` emitted.
@@ -781,3 +786,16 @@ Original prompt: add the model to the grid.The head piece should fit exactly in 
   - `npm test` passes (6 files, 31 tests).
   - `npm run build` passes.
   - Playwright skill-client attempt (`node "$CODEX_HOME/skills/develop-web-game/scripts/web_game_playwright_client.js" --url http://127.0.0.1:5173 --actions-file ...`) is blocked by Node refusing to treat the skill script as an ES module: `/Users/bradleygeiser/package.json` is `type: "commonjs"`, so the interpreter stops with `SyntaxError: Cannot use import statement outside a module` before any screenshots/state artifacts can be written.
+- Added a grid-mode Export panel in `components/CanvasGrid.tsx`:
+  - Image export (PNG/JPEG/WEBP, with quality for JPEG/WEBP).
+  - Animation export to JSON (timeline keyframes + settings).
+  - Video export to WebM/MP4 (records the current keyframe range by sampling poses and rendering frames).
+- Fixed `canvas.toBlob` usage in `exportUtils.ts` to pass quality via the third argument (instead of embedding it in the MIME string).
+- Restored mirrored left click controls (cursor-following) in grid mode:
+  - Added cursor tracking in `components/CanvasGrid.tsx` and a left-side mini rail (Play/Prev/Next/Set/Remove key) that follows the cursor Y.
+  - Verified via Playwright full-page screenshots:
+    - `output/web-game/ui-left-click-rail-2026-02-25/shot-0.png`
+    - `output/web-game/ui-left-click-rail-move-2026-02-25/shot-0.png`
+  - `npm test -- --run` passes (7 files, 36 tests).
+  - `npm run build` passes.
+- Enhanced `web_game_playwright_client.js` to support `--screenshot-mode page` and mouse moves without requiring a mouse click (helps validate cursor-follow UIs).

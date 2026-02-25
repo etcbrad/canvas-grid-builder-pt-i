@@ -140,6 +140,7 @@ interface CanvasGridProps {
   onFrameCountChange?: (frameCount: number) => void;
   onEasingChange?: (easing: string) => void;
   keyframePoseMap?: Record<number, SkeletonRotations>;
+  samplePoseForFrame?: (frame: number) => SkeletonRotations;
   onSavePoseToFrame?: (frame: number) => void;
   onApplyPoseToFrame?: (frame: number, poseName: string) => void;
   onSwapTimelineFrames?: (fromFrame: number, toFrame: number) => void;
@@ -702,6 +703,7 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
   onFrameCountChange,
   onEasingChange,
   keyframePoseMap = {},
+  samplePoseForFrame,
   onSavePoseToFrame,
   onApplyPoseToFrame,
   onSwapTimelineFrames,
@@ -771,19 +773,28 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
   const lastFkAngleRef = useRef<number>(0);
   const snapbackBackToFirstRafRef = useRef<number | null>(null);
   const timelineConsoleScrollRef = useRef<HTMLDivElement>(null);
-  const timelineConsoleScrollRafRef = useRef<number | null>(null);
   const timelineConsoleScrollTargetRef = useRef<number | null>(null);
+  const timelineSlotWheelCarryRef = useRef(0);
+  const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
+  const cursorPosRafRef = useRef<number | null>(null);
   const prevIkInteractionRef = useRef<boolean>(ikEnabled && interactionMode === "IK");
   const canvasResolutionRef = useRef<{ width: number; height: number; dpr: number } | null>(null);
   const [dragState, setDragState] = useState<{ id: string, type: "FK" | "IK" | "ROOT" } | null>(null);
   const [rootFkDragArmed, setRootFkDragArmed] = useState(false);
   const [hoveredJoint, setHoveredJoint] = useState<{ id: string; label: string; x: number; y: number } | null>(null);
   const [hoveredHeadGrid, setHoveredHeadGrid] = useState<HeadGridHoverInfo | null>(null);
+  const [cursorPos, setCursorPos] = useState<{ x: number; y: number } | null>(null);
   const [ikTargets, setIkTargets] = useState<{ [chainId: string]: { x: number, y: number } }>({});
   const ikInteractionActive = ikEnabled && interactionMode === "IK";
   const [showRefineMenu, setShowRefineMenu] = useState(false);
   const [showAnimationTimeline, setShowAnimationTimeline] = useState(true);
+  const [showExportMenu, setShowExportMenu] = useState(false);
+  const [exportBusy, setExportBusy] = useState<null | 'image' | 'video' | 'animation'>(null);
+  const [exportImageFormat, setExportImageFormat] = useState<'png' | 'jpeg' | 'webp'>('png');
+  const [exportImageQuality, setExportImageQuality] = useState(0.9);
+  const [exportVideoFpsOverride, setExportVideoFpsOverride] = useState<number | null>(null);
   const [bodyMasksEnabled, setBodyMasksEnabled] = useState(true);
+  const [maskControlsVisible, setMaskControlsVisible] = useState(true);
   const [hideBoneShapesWithMasks, setHideBoneShapesWithMasks] = useState(false);
   const [timelinePanelMode, setTimelinePanelMode] = useState<'basic' | 'advanced'>('basic');
   const [timelineMinimized, setTimelineMinimized] = useState(false);
@@ -800,6 +811,12 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
   const [refinePanelMode, setRefinePanelMode] = useState<'basic' | 'advanced'>('basic');
   const [activeDefaultPieceId, setActiveDefaultPieceId] = useState<string | null>(null);
   const [showIkAdvancedControls, setShowIkAdvancedControls] = useState(false);
+  const [jointTinkerEnabled, setJointTinkerEnabled] = useState(false);
+  const jointTinkerActivationSnapshotRef = useRef<{
+    rotations: SkeletonRotations;
+    jointTinkerLengths: Record<string, number>;
+  } | null>(null);
+  const jointTinkerWasEnabledRef = useRef(false);
   const [fkBendOffsetByJoint, setFkBendOffsetByJoint] = useState<Record<string, number>>({});
   const [fkStretchOffsetByJoint, setFkStretchOffsetByJoint] = useState<Record<string, number>>({});
   const [jointTinkerLengths, setJointTinkerLengths] = useState<Record<string, number>>({});
@@ -808,7 +825,7 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
   // Move computeWorld to top to resolve initialization order and prevent ReferenceError
   const computeWorld = useCallback((jointId: string, rotations: SkeletonRotations, canvasCenter: [number, number]): WorldCoords => {
     // If joint tinker mode is active, use modified bone lengths
-    if (showIkAdvancedControls && Object.keys(jointTinkerLengths).length > 0) {
+    if (jointTinkerEnabled && Object.keys(jointTinkerLengths).length > 0) {
       const path: string[] = [];
       let currentJointId: string | null = jointId;
       while (currentJointId) {
@@ -840,12 +857,12 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
         const originalLength = Math.hypot(pivotX, pivotY);
         const tinkerLength = jointTinkerLengths[pathJointId];
         const effectiveLength = (tinkerLength !== undefined && tinkerLength > 0) ? tinkerLength : originalLength;
-        
-        // Scale the pivot vector to match the effective length
-        const scale = effectiveLength / originalLength;
-        const scaledPivotX = pivotX * scale;
-        const scaledPivotY = pivotY * scale;
-        
+
+        const hasLength = Number.isFinite(originalLength) && originalLength > 1e-6;
+        const scale = hasLength ? (effectiveLength / originalLength) : 1;
+        const scaledPivotX = hasLength ? pivotX * scale : pivotX;
+        const scaledPivotY = hasLength ? pivotY * scale : pivotY;
+
         const cosA = Math.cos(worldAngle * Math.PI / 180);
         const sinA = Math.sin(worldAngle * Math.PI / 180);
         worldX += scaledPivotX * cosA - scaledPivotY * sinA;
@@ -868,7 +885,31 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
       y: rootY,
       rotate: rootRotate,
     });
-  }, [bitruviusData.JOINT_DEFS, rootX, rootY, rootRotate, showIkAdvancedControls, jointTinkerLengths]);
+  }, [bitruviusData.JOINT_DEFS, rootX, rootY, rootRotate, jointTinkerEnabled, jointTinkerLengths]);
+
+  useEffect(() => {
+    if (interactionMode !== 'FK' && jointTinkerEnabled) {
+      setJointTinkerEnabled(false);
+    }
+  }, [interactionMode, jointTinkerEnabled, jointTinkerLengths]);
+
+  useEffect(() => {
+    if (jointTinkerEnabled && !jointTinkerWasEnabledRef.current) {
+      jointTinkerActivationSnapshotRef.current = {
+        rotations: { ...(rotationsRef.current ?? {}) },
+        jointTinkerLengths: { ...(jointTinkerLengths ?? {}) },
+      };
+    } else if (!jointTinkerEnabled && jointTinkerWasEnabledRef.current) {
+      jointTinkerActivationSnapshotRef.current = null;
+    }
+    jointTinkerWasEnabledRef.current = jointTinkerEnabled;
+  }, [jointTinkerEnabled, jointTinkerLengths]);
+
+  useEffect(() => {
+    if (interactionMode !== 'IK' && showIkAdvancedControls) {
+      setShowIkAdvancedControls(false);
+    }
+  }, [interactionMode, showIkAdvancedControls]);
 
   useEffect(() => {
     if (typeof window === 'undefined') {
@@ -896,39 +937,35 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
     }
   }, [ikPosePrograms]);
 
-  // Clear joint tinker lengths when mode is disabled
-  useEffect(() => {
-    if (!showIkAdvancedControls && Object.keys(jointTinkerLengths).length > 0) {
-      setJointTinkerLengths({});
+  const revertJointTinkerToActivation = useCallback(() => {
+    const snapshot = jointTinkerActivationSnapshotRef.current;
+    if (!snapshot) {
+      return;
     }
-  }, [showIkAdvancedControls, jointTinkerLengths]);
+    setJointTinkerLengths({ ...snapshot.jointTinkerLengths });
 
-  // Initialize all joint tinker lengths when mode is enabled
-  useEffect(() => {
-    if (showIkAdvancedControls && Object.keys(jointTinkerLengths).length === 0) {
-      const initialLengths: Record<string, number> = {};
-      Object.keys(bitruviusData.JOINT_DEFS).forEach((jointId) => {
-        if (jointId !== 'root') {
-          const jointDef = bitruviusData.JOINT_DEFS[jointId];
-          if (jointDef) {
-            const originalLength = Math.hypot(jointDef.pivot[0], jointDef.pivot[1]);
-            initialLengths[jointId] = originalLength;
-          }
-        }
-      });
-      setJointTinkerLengths(initialLengths);
-    }
-  }, [showIkAdvancedControls, jointTinkerLengths, bitruviusData.JOINT_DEFS]);
+    const nextRots = { ...snapshot.rotations };
+    rotationsRef.current = nextRots;
+    lastValidRotationsRef.current = nextRots;
+    fkTargetRotationRef.current = {};
+    fkLastEventTsRef.current = {};
+    onRotationsChange?.(nextRots);
+  }, [onRotationsChange]);
 
-  // Recovery function to reset joint tinker state
-  const resetJointTinkerState = useCallback(() => {
+  const resetJointTinkerToDefaultPose = useCallback(() => {
     setJointTinkerLengths({});
-    setShowIkAdvancedControls(false);
-    // Reset to default pose
-    if (onReturnDefaultPose) {
-      onReturnDefaultPose();
-    }
-  }, [setJointTinkerLengths, setShowIkAdvancedControls, onReturnDefaultPose]);
+    fkTargetRotationRef.current = {};
+    fkLastEventTsRef.current = {};
+    onReturnDefaultPose?.();
+  }, [onReturnDefaultPose]);
+
+  const recoverFromJointTinkerCorruption = useCallback(() => {
+    setJointTinkerEnabled(false);
+    setJointTinkerLengths({});
+    fkTargetRotationRef.current = {};
+    fkLastEventTsRef.current = {};
+    onReturnDefaultPose?.();
+  }, [onReturnDefaultPose]);
 
   const isIkPoseProgramActive = useCallback((program: IkPoseProgram): boolean => {
     return (
@@ -1126,6 +1163,20 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
     });
     return out;
   }, [ikSolveMode, legIntentMode, postureState, postureRoll, weightShiftDepth, poseDirection, activeIKChains, bitruviusData]);
+
+  const scheduleCursorPosUpdate = useCallback((x: number, y: number) => {
+    if (!Number.isFinite(x) || !Number.isFinite(y)) {
+      return;
+    }
+    cursorPosRef.current = { x, y };
+    if (cursorPosRafRef.current !== null) {
+      return;
+    }
+    cursorPosRafRef.current = requestAnimationFrame(() => {
+      cursorPosRafRef.current = null;
+      setCursorPos(cursorPosRef.current);
+    });
+  }, []);
 
   // Requirement: Guides back out to the border (0 margin for guides)
   const UI_INSET = 12;
@@ -1331,42 +1382,47 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
     setPoseLibrarySearch('');
   }, [poseLibraryFrame, onApplyPoseToFrame]);
 
-  const handleTimelineWheel = useCallback((event: React.WheelEvent<HTMLDivElement>) => {
+  const handleTimelineSlotsWheel = useCallback((event: React.WheelEvent<HTMLDivElement>) => {
+    if (maxTimelineScrollIndex <= 0) {
+      return;
+    }
     const container = timelineConsoleScrollRef.current;
-    if (!container) {
-      return;
-    }
-    const maxScroll = Math.max(0, container.scrollHeight - container.clientHeight);
-    if (maxScroll <= 0) {
-      return;
-    }
-    event.preventDefault();
-    const currentTarget = timelineConsoleScrollTargetRef.current ?? container.scrollTop;
-    const nextTarget = clamp(currentTarget + event.deltaY, 0, maxScroll);
-    timelineConsoleScrollTargetRef.current = nextTarget;
-    if (timelineConsoleScrollRafRef.current !== null) {
-      return;
+    const scrollTopBefore = container?.scrollTop ?? 0;
+
+    event.stopPropagation();
+
+    let deltaY = event.deltaY;
+    if (event.deltaMode === 1) {
+      deltaY *= 16;
+    } else if (event.deltaMode === 2) {
+      deltaY *= 800;
     }
 
-    const animate = () => {
-      const element = timelineConsoleScrollRef.current;
-      if (!element) {
-        timelineConsoleScrollRafRef.current = null;
-        return;
+    if (event.shiftKey) {
+      const direction = deltaY >= 0 ? 1 : -1;
+      timelineSlotWheelCarryRef.current = 0;
+      setTimelineScrollIndex((prev) =>
+        clamp(prev + direction * timelineSlotsVisible, 0, maxTimelineScrollIndex)
+      );
+    } else {
+      const pixelsPerSlot = 44;
+      timelineSlotWheelCarryRef.current += deltaY;
+      const slots = Math.trunc(timelineSlotWheelCarryRef.current / pixelsPerSlot);
+      if (slots !== 0) {
+        timelineSlotWheelCarryRef.current -= slots * pixelsPerSlot;
+        setTimelineScrollIndex((prev) => clamp(prev + slots, 0, maxTimelineScrollIndex));
       }
-      const target = timelineConsoleScrollTargetRef.current ?? element.scrollTop;
-      const delta = target - element.scrollTop;
-      if (Math.abs(delta) <= 0.5) {
-        element.scrollTop = target;
-        timelineConsoleScrollRafRef.current = null;
-        return;
-      }
-      element.scrollTop += delta * 0.24;
-      timelineConsoleScrollRafRef.current = requestAnimationFrame(animate);
-    };
+    }
 
-    timelineConsoleScrollRafRef.current = requestAnimationFrame(animate);
-  }, []);
+    if (container) {
+      requestAnimationFrame(() => {
+        const element = timelineConsoleScrollRef.current;
+        if (!element) return;
+        element.scrollTop = scrollTopBefore;
+        timelineConsoleScrollTargetRef.current = scrollTopBefore;
+      });
+    }
+  }, [maxTimelineScrollIndex, timelineSlotsVisible]);
   const handleTimelineBackToFirst = useCallback(() => {
     if (!onSetCurrentFrame) {
       return;
@@ -1374,10 +1430,11 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
     if (isPlaying && onTogglePlayback) {
       onTogglePlayback();
     }
-    const activePreset = timelineFunctionPresets.find((preset) => preset.id === activeTimelineFunctionId);
-    const snapbackFrames = activePreset?.backToFirstFrames;
+    
     const startFrame = Math.max(0, Math.round(currentFrame));
-    if (!snapbackFrames || snapbackFrames <= 1 || startFrame <= 0) {
+    
+    // Reset mode: go back to frame 1 in half of the frames
+    if (startFrame <= 1) {
       onSetCurrentFrame(0);
       return;
     }
@@ -1387,7 +1444,8 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
       snapbackBackToFirstRafRef.current = null;
     }
 
-    const totalSteps = Math.max(1, Math.round(snapbackFrames));
+    // Calculate half of the current frames as the duration
+    const totalSteps = Math.max(1, Math.round(startFrame / 2));
     let step = 0;
     const animateToFirst = () => {
       step += 1;
@@ -1402,24 +1460,18 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
         onSetCurrentFrame(0);
       }
     };
-    animateToFirst();
-  }, [
-    onSetCurrentFrame,
-    isPlaying,
-    onTogglePlayback,
-    timelineFunctionPresets,
-    activeTimelineFunctionId,
-    currentFrame,
-  ]);
+
+    snapbackBackToFirstRafRef.current = requestAnimationFrame(animateToFirst);
+  }, [onSetCurrentFrame, isPlaying, onTogglePlayback, currentFrame]);
 
   useEffect(() => {
     return () => {
       if (snapbackBackToFirstRafRef.current !== null) {
         cancelAnimationFrame(snapbackBackToFirstRafRef.current);
       }
-      if (timelineConsoleScrollRafRef.current !== null) {
-        cancelAnimationFrame(timelineConsoleScrollRafRef.current);
-        timelineConsoleScrollRafRef.current = null;
+      if (cursorPosRafRef.current !== null) {
+        cancelAnimationFrame(cursorPosRafRef.current);
+        cursorPosRafRef.current = null;
       }
       // Cleanup delayed clearing timeouts
       if (ikClearTimeoutRef.current) {
@@ -1458,7 +1510,7 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
 
   // Safeguard: Check if skeleton is too distorted and auto-recover
   const checkSkeletonIntegrity = useCallback(() => {
-    if (!showIkAdvancedControls) return;
+    if (!jointTinkerEnabled || Object.keys(jointTinkerLengths).length === 0) return;
     
     // Check a few key joints to ensure they're in reasonable positions
     const keyJoints = ['head', 'l_palm', 'r_palm', 'l_heel', 'r_heel'];
@@ -1479,13 +1531,13 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
     // If joints are too far from center (indicating radial breakup), auto-recover
     if (averageDistance > 500) {
       console.warn('Skeleton integrity compromised - auto-recovering joint tinker');
-      resetJointTinkerState();
+      recoverFromJointTinkerCorruption();
     }
-  }, [showIkAdvancedControls, rotationsRef, computeWorld, resetJointTinkerState]);
+  }, [jointTinkerEnabled, jointTinkerLengths, rotationsRef, computeWorld, recoverFromJointTinkerCorruption]);
 
   // Check skeleton integrity periodically when joint tinker is active
   useEffect(() => {
-    if (!showIkAdvancedControls) return;
+    if (!jointTinkerEnabled || Object.keys(jointTinkerLengths).length === 0) return;
     
     const interval = setInterval(() => {
       checkSkeletonIntegrity();
@@ -1495,13 +1547,13 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
       console.log(`Joint Tinker Active: ${activeJoints} joints modified`);
       
       // Emergency reset if too many joints are modified (potential corruption)
-      if (activeJoints > 15) {
+      if (activeJoints > 40) {
         console.warn('Too many joints modified - emergency reset');
-        resetJointTinkerState();
+        recoverFromJointTinkerCorruption();
       }
     }, 2000); // Check every 2 seconds
     return () => clearInterval(interval);
-  }, [showIkAdvancedControls, checkSkeletonIntegrity, jointTinkerLengths, resetJointTinkerState]);
+  }, [jointTinkerEnabled, checkSkeletonIntegrity, jointTinkerLengths, recoverFromJointTinkerCorruption]);
 
   const computeThumbPosePath = useCallback((pose: SkeletonRotations): { path: string; joints: Array<{ x: number; y: number }> } => {
     const center: [number, number] = [0, 0];
@@ -1993,6 +2045,11 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
   };
 
   const handleMouseMove = (e: React.MouseEvent) => {
+    const rect = canvasRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    scheduleCursorPosUpdate(mx, my);
     const fkLivePoseDuringPlayback = isPlaying && (dragState?.type === 'FK' || dragState?.type === 'ROOT');
     if (isPlaying && !fkLivePoseDuringPlayback) {
       if (dragState) {
@@ -2002,10 +2059,6 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
       setHoveredHeadGrid((prev) => (prev ? null : prev));
       return;
     }
-    const rect = canvasRef.current?.getBoundingClientRect();
-    if (!rect) return;
-    const mx = e.clientX - rect.left;
-    const my = e.clientY - rect.top;
     const center = sceneViewport.center;
     if (!dragState) {
       updateHoveredJoint(mx, my, center);
@@ -2031,8 +2084,8 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
         return;
       }
       
-      // Joint Tinker Mode: Drag joint positions directly, extending/compacting bones
-      if (showIkAdvancedControls && id !== 'root') {
+      // Joint Tinker Mode: Direct joint position manipulation (simplified approach)
+      if (jointTinkerEnabled && id !== 'root') {
         // Convert screen coordinates to world coordinates
         const targetWorld = fromDisplayPoint(mx, my);
         
@@ -2042,78 +2095,80 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
         
         const parentWorld = computeWorld(parentId, rotationsRef.current, center);
         
-        // Calculate the desired position relative to parent (simpler approach)
+        // Calculate desired position relative to parent (simple approach)
         const relativePosition = {
           x: targetWorld.x - parentWorld.x,
           y: targetWorld.y - parentWorld.y
         };
         
-        // Get original bone vector from joint definition
+        // Get original bone vector
         const jointDef = bitruviusData.JOINT_DEFS[id];
+        if (!jointDef) return;
+        
         const originalPivot = { x: jointDef.pivot[0], y: jointDef.pivot[1] };
         const originalLength = Math.hypot(originalPivot.x, originalPivot.y);
-        
-        // Calculate the new bone length
-        const newLength = Math.hypot(relativePosition.x, relativePosition.y);
-        
-        if (originalLength > 0 && newLength > 0 && isFinite(newLength)) {
-          // Apply constraints to prevent extreme changes
-          const minLength = originalLength * 0.5; // Minimum 50% of original length
-          const maxLength = originalLength * 2.0; // Maximum 200% of original length
-          const constrainedLength = Math.max(minLength, Math.min(newLength, maxLength));
-          
-          // Calculate the angle needed to point from parent to target position
-          const desiredAngle = r2d(Math.atan2(relativePosition.y, relativePosition.x));
-          const parentAngle = parentWorld.angle;
-          
-          // Calculate the local rotation that would achieve this position
-          let targetLocal = normA(desiredAngle - parentAngle);
-          
-          // Apply constraints if enabled
-          const lim = bitruviusData.JOINT_LIMITS[id];
-          if (fkConstraintsEnabled && lim) {
-            targetLocal = clamp(targetLocal, lim.min, lim.max);
-          }
-          
-          // Smooth the rotation
-          const previousLocal = rotationsRef.current[id] ?? 0;
-          const now = performance.now();
-          const previousEventTs = fkLastEventTsRef.current[id] ?? now;
-          const dtMs = Math.max(0, now - previousEventTs);
-          fkLastEventTsRef.current[id] = now;
-          
-          const fkRotationFluidity = clamp((fkRotationSensitivity + fkRotationResponse) / 2, 0.35, 1.6);
-          const fluidityAlpha = fkRotationFluidity >= 1
-            ? 1
-            : resolveTemporalAlpha(fkRotationFluidity, dtMs || IK_BASE_FRAME_MS);
-          const dtScale = clamp(dtMs || IK_BASE_FRAME_MS, IK_EVENT_DT_MIN_MS, IK_EVENT_DT_MAX_MS) / IK_BASE_FRAME_MS;
-          const maxStep = FK_ROTATION_STEP_MAX * Math.max(0.55, fkRotationFluidity) * dtScale;
-          
-          let local = previousLocal + clamp(
-            normA(targetLocal - previousLocal) * fluidityAlpha,
-            -maxStep,
-            maxStep
-          );
-          
-          if (fkConstraintsEnabled && lim) local = clamp(local, lim.min, lim.max);
-          
-          const localDelta = normA(local - previousLocal);
-          if (Math.abs(localDelta) <= FK_ROTATION_APPLY_EPSILON_DEG) {
-            return;
-          }
-          
-          // Update the dynamic bone length for this joint (simpler approach)
-          setJointTinkerLengths(prev => ({
-            ...prev,
-            [id]: constrainedLength
-          }));
-          
-          // Apply rotation to current joint only (maintain hierarchy)
-          const nextRots = { ...rotationsRef.current, [id]: local };
-          rotationsRef.current = nextRots;
-          lastValidRotationsRef.current = nextRots;
-          onRotationsChange?.(nextRots);
+        if (!Number.isFinite(originalLength) || originalLength <= 1e-6) {
+          return;
         }
+        
+        // Calculate new bone length and angle
+        const newLength = Math.hypot(relativePosition.x, relativePosition.y);
+        const desiredAngle = r2d(Math.atan2(relativePosition.y, relativePosition.x));
+        const parentAngle = parentWorld.angle;
+        
+        // Apply simple constraints
+        const constrainedLength = Math.max(
+          originalLength * 0.3, // Minimum 30% of original
+          Math.min(newLength, originalLength * 3.0) // Maximum 300% of original
+        );
+        
+        // Calculate local rotation
+        let targetLocal = normA(desiredAngle - parentAngle);
+        
+        // Apply joint limits if enabled
+        const lim = bitruviusData.JOINT_LIMITS[id];
+        if (fkConstraintsEnabled && lim) {
+          targetLocal = clamp(targetLocal, lim.min, lim.max);
+        }
+        
+        // Update bone length
+        setJointTinkerLengths(prev => ({
+          ...prev,
+          [id]: constrainedLength
+        }));
+        
+        // Apply rotation with smoothing
+        const previousLocal = rotationsRef.current[id] ?? 0;
+        const now = performance.now();
+        const previousEventTs = fkLastEventTsRef.current[id] ?? now;
+        const dtMs = Math.max(0, now - previousEventTs);
+        fkLastEventTsRef.current[id] = now;
+        
+        const fkRotationFluidity = clamp((fkRotationSensitivity + fkRotationResponse) / 2, 0.35, 1.6);
+        const fluidityAlpha = fkRotationFluidity >= 1
+          ? 1
+          : resolveTemporalAlpha(fkRotationFluidity, dtMs || IK_BASE_FRAME_MS);
+        const dtScale = clamp(dtMs || IK_BASE_FRAME_MS, IK_EVENT_DT_MIN_MS, IK_EVENT_DT_MAX_MS) / IK_BASE_FRAME_MS;
+        const maxStep = FK_ROTATION_STEP_MAX * Math.max(0.55, fkRotationFluidity) * dtScale;
+        
+        let local = previousLocal + clamp(
+          normA(targetLocal - previousLocal) * fluidityAlpha,
+          -maxStep,
+          maxStep
+        );
+        
+        if (fkConstraintsEnabled && lim) local = clamp(local, lim.min, lim.max);
+        
+        const localDelta = normA(local - previousLocal);
+        if (Math.abs(localDelta) <= FK_ROTATION_APPLY_EPSILON_DEG) {
+          return;
+        }
+        
+        // Apply rotation
+        const nextRots = { ...rotationsRef.current, [id]: local };
+        rotationsRef.current = nextRots;
+        lastValidRotationsRef.current = nextRots;
+        onRotationsChange?.(nextRots);
         return;
       }
       
@@ -2772,11 +2827,211 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
     showAnimationTimeline || activeMaskEditorJointId !== null
       ? timelineRailWidth + UI_INSET
       : UI_INSET;
+  const cursorClickRailTop = React.useMemo(() => {
+    const y = cursorPos?.y ?? sceneViewport.center[1];
+    return clamp(y - 110, gridRefineTop + 52, height - 260);
+  }, [cursorPos, gridRefineTop, height, sceneViewport.center]);
   const poseLibraryDisplayFrame = poseLibraryFrame !== null ? poseLibraryFrame + 1 : null;
   const defaultPoseThumb = React.useMemo(() => {
     const sourcePose = bitruviusData.POSES?.["T-Pose"] ?? bitruviusData.POSES?.["Neutral"] ?? currentRotations;
     return computeThumbPosePath(sourcePose);
   }, [bitruviusData.POSES, currentRotations, computeThumbPosePath]);
+
+  const createExportTimestamp = useCallback(
+    () => new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5),
+    []
+  );
+
+  const downloadTextFile = useCallback((content: string, filename: string, mimeType: string) => {
+    const blob = new Blob([content], { type: mimeType });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    link.style.display = 'none';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    setTimeout(() => URL.revokeObjectURL(url), 200);
+  }, []);
+
+  const resolveTimelineRange = useCallback(() => {
+    const maxFrame = Math.max(0, Math.round((frameCount ?? 1) - 1));
+    const frames = (keyframeFrames ?? [])
+      .map((frame) => (Number.isFinite(frame) ? Math.round(frame) : null))
+      .filter((frame): frame is number => frame !== null)
+      .sort((a, b) => a - b);
+    if (!frames.length) {
+      return { startFrame: 0, endFrame: maxFrame };
+    }
+    return {
+      startFrame: clamp(frames[0], 0, maxFrame),
+      endFrame: clamp(frames[frames.length - 1], 0, maxFrame),
+    };
+  }, [frameCount, keyframeFrames]);
+
+  const handleExportImageClick = useCallback(async () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    setExportBusy('image');
+    try {
+      await exportCanvasAsImage(canvas, {
+        format: exportImageFormat,
+        quality: exportImageQuality,
+      });
+    } finally {
+      setExportBusy(null);
+    }
+  }, [exportImageFormat, exportImageQuality]);
+
+  const handleExportAnimationJsonClick = useCallback(() => {
+    const frames = Array.from(
+      new Set(
+        (keyframeFrames ?? [])
+          .map((frame) => (Number.isFinite(frame) ? Math.round(frame) : null))
+          .filter((frame): frame is number => frame !== null)
+      )
+    ).sort((a, b) => a - b);
+
+    const keyframes = frames
+      .map((frame) => {
+        const pose = keyframePoseMap?.[frame];
+        if (!pose) return null;
+        return { frame, pose };
+      })
+      .filter((entry): entry is { frame: number; pose: SkeletonRotations } => entry !== null);
+
+    const payload = {
+      schema: 'canvas-grid-builder.animation.v1',
+      createdAt: Date.now(),
+      fps: Math.max(1, Math.round(fps ?? 24)),
+      frameCount: Math.max(1, Math.round(frameCount ?? 1)),
+      easing: easing ?? null,
+      keyframes,
+      segmentInterpolationFrames: segmentInterpolationFrames ?? {},
+      segmentIkTweenMap: segmentIkTweenMap ?? {},
+    };
+
+    setExportBusy('animation');
+    try {
+      downloadTextFile(
+        JSON.stringify(payload, null, 2),
+        `animation-export-${createExportTimestamp()}.json`,
+        'application/json'
+      );
+    } finally {
+      setExportBusy(null);
+    }
+  }, [
+    createExportTimestamp,
+    downloadTextFile,
+    easing,
+    fps,
+    frameCount,
+    keyframeFrames,
+    keyframePoseMap,
+    segmentIkTweenMap,
+    segmentInterpolationFrames,
+  ]);
+
+  const handleExportTimelineVideoClick = useCallback(
+    async (options: { format?: 'webm' | 'mp4'; fps?: number; duration?: number; filename?: string } = {}) => {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      if (!samplePoseForFrame) return;
+
+      if (isPlaying && onTogglePlayback) {
+        onTogglePlayback();
+      }
+
+      const exportFps = Math.max(1, Math.round(options.fps ?? exportVideoFpsOverride ?? fps ?? 24));
+      const { startFrame, endFrame } = resolveTimelineRange();
+      const rangeLength = Math.max(1, endFrame - startFrame + 1);
+      const seconds = options.duration ?? rangeLength / exportFps;
+
+      let frameIndex = 0;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      const dpr = canvasResolutionRef.current?.dpr ?? window.devicePixelRatio ?? 1;
+
+      setExportBusy('video');
+      try {
+        await exportCanvasAsVideo(
+          canvas,
+          () => {
+            const frameToSample = clamp(startFrame + frameIndex, startFrame, endFrame);
+            frameIndex += 1;
+            const sampledPose = samplePoseForFrame(frameToSample);
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            render({
+              ctx,
+              width,
+              height,
+              viewWindow: sceneViewport,
+              majorGridSize,
+              minorGridSize,
+              bitruviusData,
+              rotations: sampledPose,
+              mocapMode,
+              silhouetteMode,
+              lotteMode,
+              ikTargets: {},
+              computeWorld,
+              ghostFrames: [],
+              visualModules,
+              backgroundLayer: resolvedBackgroundLayer,
+              foregroundLayer: resolvedForegroundLayer,
+              bodyPartMasks: bodyMasksEnabled ? resolvedBodyPartMaskLayers : {},
+              gridOnlyMode,
+              runtimeGeometry,
+              showIkDebugOverlay: false,
+              headGridHover: null,
+              defaultPieceConfigs,
+              hideBoneShapesWithMasks: hideBoneShapesWithMasks && bodyMasksEnabled,
+            });
+          },
+          {
+            format: options.format ?? 'webm',
+            fps: exportFps,
+            duration: seconds,
+            filename:
+              options.filename ??
+              `video-export-${createExportTimestamp()}.${(options.format ?? 'webm') === 'mp4' ? 'mp4' : 'webm'}`,
+          }
+        );
+      } finally {
+        setExportBusy(null);
+      }
+    },
+    [
+      createExportTimestamp,
+      exportVideoFpsOverride,
+      fps,
+      width,
+      height,
+      sceneViewport,
+      majorGridSize,
+      minorGridSize,
+      bitruviusData,
+      mocapMode,
+      silhouetteMode,
+      lotteMode,
+      computeWorld,
+      visualModules,
+      resolvedBackgroundLayer,
+      resolvedForegroundLayer,
+      resolvedBodyPartMaskLayers,
+      bodyMasksEnabled,
+      gridOnlyMode,
+      runtimeGeometry,
+      defaultPieceConfigs,
+      hideBoneShapesWithMasks,
+      isPlaying,
+      onTogglePlayback,
+      resolveTimelineRange,
+      samplePoseForFrame,
+    ]
+  );
 
   useImperativeHandle(ref, () => ({
     exportAsImage: async (options = {}) => {
@@ -2785,18 +3040,10 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
       await exportCanvasAsImage(canvas, { format: 'png', ...options });
     },
     exportAsVideo: async (options = {}) => {
-      const canvas = canvasRef.current;
-      if (!canvas) throw new Error('Canvas not available');
-      await exportCanvasAsVideo(canvas, () => {
-        // Force a render frame
-        const renderFrame = () => {
-          // This will trigger the existing render loop
-        };
-        renderFrame();
-      }, { format: 'webm', ...options });
+      await handleExportTimelineVideoClick(options);
     },
     getCanvas: () => canvasRef.current,
-  }), [canvasRef]);
+  }), [handleExportTimelineVideoClick]);
 
   return (
     <div className="relative overflow-hidden" style={{ width: `${width}px`, height: `${height}px` }}>
@@ -2832,7 +3079,7 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
       />
 
       {gridOnlyMode && bodyMasksEnabled && bodyMaskUploadHandles.length > 0 ? (
-        <div className="absolute inset-0 pointer-events-none" style={{ zIndex: 74 }}>
+        <div className={`absolute inset-0 pointer-events-none transition-opacity duration-200 ${maskControlsVisible ? 'opacity-100' : 'opacity-0'}`} style={{ zIndex: 74 }}>
           <svg className="absolute inset-0 w-full h-full pointer-events-none">
             {bodyMaskUploadHandles.map((handle) => (
               <line
@@ -2916,6 +3163,86 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
         </div>
       ) : null}
 
+      {gridOnlyMode && showAnimationTimeline && activeMaskEditorJointId === null && (onTogglePlayback || onSetCurrentFrame || onSetKeyframe || onRemoveKeyframe) ? (
+        <div
+          className="absolute pointer-events-auto"
+          style={{
+            left: `${UI_INSET}px`,
+            top: `${cursorClickRailTop}px`,
+            zIndex: 74,
+          }}
+        >
+          <div
+            className="border shadow-xl backdrop-blur-sm flex flex-col gap-1.5 p-2"
+            style={{
+              width: '140px',
+              background: CONSOLE_PANEL_BACKGROUND,
+              borderColor: 'rgba(158, 150, 184, 0.5)',
+            }}
+          >
+            <div className="flex items-center justify-between text-[10px] tracking-[0.12em] uppercase text-zinc-300">
+              <span>Controls</span>
+              <span className="text-zinc-500">F{Math.max(1, Math.round(currentFrame) + 1)}</span>
+            </div>
+            {onTogglePlayback ? (
+              <button
+                type="button"
+                onClick={onTogglePlayback}
+                disabled={animationControlDisabled}
+                className="w-full min-h-8 px-2 py-1.5 text-[11px] border border-white/15 rounded text-zinc-100 hover:bg-white/10 transition-colors disabled:opacity-45 disabled:cursor-not-allowed"
+                title="Play/pause"
+              >
+                {isPlaying ? 'Pause' : 'Play'}
+              </button>
+            ) : null}
+            {onSetCurrentFrame ? (
+              <div className="grid grid-cols-2 gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => onSetCurrentFrame(Math.max(0, Math.round(currentFrame) - 1))}
+                  disabled={animationControlDisabled}
+                  className="min-h-8 px-2 py-1 text-[11px] border border-white/15 rounded text-zinc-300 hover:bg-white/10 transition-colors disabled:opacity-45 disabled:cursor-not-allowed"
+                  title="Previous frame"
+                >
+                  Prev
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onSetCurrentFrame(Math.round(currentFrame) + 1)}
+                  disabled={animationControlDisabled}
+                  className="min-h-8 px-2 py-1 text-[11px] border border-white/15 rounded text-zinc-300 hover:bg-white/10 transition-colors disabled:opacity-45 disabled:cursor-not-allowed"
+                  title="Next frame"
+                >
+                  Next
+                </button>
+              </div>
+            ) : null}
+            {onSetKeyframe ? (
+              <button
+                type="button"
+                onClick={onSetKeyframe}
+                disabled={animationControlDisabled}
+                className="w-full min-h-8 px-2 py-1 text-[11px] border border-white/15 rounded text-zinc-200 hover:bg-white/10 transition-colors disabled:opacity-45 disabled:cursor-not-allowed"
+                title="Capture current pose for this frame"
+              >
+                Capture Current
+              </button>
+            ) : null}
+            {onRemoveKeyframe ? (
+              <button
+                type="button"
+                onClick={onRemoveKeyframe}
+                disabled={animationControlDisabled || !isCurrentFrameKeyframe}
+                className="w-full min-h-8 px-2 py-1 text-[11px] border border-white/15 rounded text-zinc-200 hover:bg-white/10 transition-colors disabled:opacity-45 disabled:cursor-not-allowed"
+                title="Clear the pose for this frame"
+              >
+                Clear Current
+              </button>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+
       {gridOnlyMode && showAnimationTimeline && activeMaskEditorJointId === null ? (
         <div
           className="absolute pointer-events-auto"
@@ -2948,11 +3275,19 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
                 </button>
                 <button
                   type="button"
-                  onClick={() => setShowIkAdvancedControls((prev) => !prev)}
+                  onClick={() => {
+                    if (interactionMode === 'FK') {
+                      setJointTinkerEnabled((prev) => !prev);
+                    } else {
+                      setShowIkAdvancedControls((prev) => !prev);
+                    }
+                  }}
                   className="min-h-7 px-2 py-1 text-[10px] border border-white/15 rounded text-zinc-100 hover:bg-white/10 transition-colors"
-                  title="Toggle joint tinkering controls"
+                  title={interactionMode === 'FK' ? 'Toggle FK joint tinkering mode' : 'Toggle advanced IK controls'}
                 >
-                  Joint Tinker: {showIkAdvancedControls ? 'On' : 'Off'}
+                  {interactionMode === 'FK'
+                    ? `Joint Tinker: ${jointTinkerEnabled ? 'On' : 'Off'}`
+                    : `IK Advanced: ${showIkAdvancedControls ? 'On' : 'Off'}`}
                 </button>
                 <button
                   type="button"
@@ -2976,7 +3311,6 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
             {!timelineMinimized ? (
               <div
                 ref={timelineConsoleScrollRef}
-                onWheel={handleTimelineWheel}
                 onScroll={(event) => {
                   timelineConsoleScrollTargetRef.current = event.currentTarget.scrollTop;
                 }}
@@ -3593,7 +3927,12 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
                   </>
                 ) : null}
 
-                <div className="space-y-2 pr-1">
+                <div
+                  data-testid="timeline-slots"
+                  onWheel={handleTimelineSlotsWheel}
+                  className="space-y-2 pr-1"
+                  style={{ overscrollBehavior: 'contain' }}
+                >
                   {Array.from({ length: timelineSlotsVisible }).map((_, index) => {
                     const slotIndex = clampedTimelineScrollIndex + index;
                     const displayFrame = 1 + slotIndex * timelineStep;
@@ -3977,7 +4316,7 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
                     onClick={handleTimelineBackToFirst}
                     disabled={animationControlDisabled || !onSetCurrentFrame}
                     className="w-full min-h-8 px-2 py-1.5 text-[11px] border border-white/15 rounded text-zinc-100 hover:bg-white/10 transition-colors disabled:opacity-45 disabled:cursor-not-allowed"
-                    title="Return to frame 1"
+                    title="Reset to frame 1 in half the frames"
                   >
                     Back to 1
                   </button>
@@ -4304,37 +4643,73 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
             {interactionMode === "FK" && onMovementTogglesChange ? (
               <button
                 type="button"
-                onClick={() => setShowIkAdvancedControls((prev) => !prev)}
+                onClick={() => setJointTinkerEnabled((prev) => !prev)}
                 className="min-h-9 px-3 py-2 text-[11px] tracking-[0.1em] font-semibold uppercase rounded transition-colors"
                 style={{
-                  background: showIkAdvancedControls
+                  background: jointTinkerEnabled
                     ? 'rgba(16, 88, 56, 0.34)'
                     : 'rgba(88, 82, 108, 0.28)',
-                  border: showIkAdvancedControls
+                  border: jointTinkerEnabled
                     ? '1px solid rgba(74, 222, 128, 0.62)'
                     : '1px solid rgba(158, 150, 184, 0.62)',
                   color: 'rgba(232, 228, 243, 0.95)',
                 }}
                 title="Toggle joint tinker mode for click and drag joint manipulation"
               >
-                Joint Tinker {showIkAdvancedControls ? 'On' : 'Off'}
+                Joint Tinker {jointTinkerEnabled ? 'On' : 'Off'}
               </button>
             ) : null}
 
-            {showIkAdvancedControls && onReturnDefaultPose ? (
+            {interactionMode === "IK" ? (
               <button
                 type="button"
-                onClick={resetJointTinkerState}
+                onClick={() => setShowIkAdvancedControls((prev) => !prev)}
                 className="min-h-9 px-3 py-2 text-[11px] tracking-[0.1em] font-semibold uppercase rounded transition-colors"
                 style={{
-                  background: 'rgba(220, 38, 38, 0.34)',
-                  border: '1px solid rgba(248, 113, 113, 0.62)',
-                  color: 'rgba(254, 226, 226, 0.95)',
+                  background: showIkAdvancedControls
+                    ? 'rgba(90, 56, 170, 0.34)'
+                    : 'rgba(88, 82, 108, 0.28)',
+                  border: showIkAdvancedControls
+                    ? '1px solid rgba(168, 85, 247, 0.62)'
+                    : '1px solid rgba(158, 150, 184, 0.62)',
+                  color: 'rgba(232, 228, 243, 0.95)',
                 }}
-                title="Reset joint tinker and restore default pose"
+                title="Toggle advanced IK controls (solver/profile/scope)"
               >
-                Reset Tinker
+                IK Advanced {showIkAdvancedControls ? 'On' : 'Off'}
               </button>
+            ) : null}
+
+            {jointTinkerEnabled ? (
+              <>
+                <button
+                  type="button"
+                  onClick={revertJointTinkerToActivation}
+                  className="min-h-9 px-3 py-2 text-[11px] tracking-[0.1em] font-semibold uppercase rounded transition-colors"
+                  style={{
+                    background: 'rgba(88, 82, 108, 0.3)',
+                    border: '1px solid rgba(158, 150, 184, 0.62)',
+                    color: 'rgba(232, 228, 243, 0.95)',
+                  }}
+                  title="Revert pose + joint lengths to state when Joint Tinker was enabled"
+                >
+                  Revert
+                </button>
+                <button
+                  type="button"
+                  onClick={resetJointTinkerToDefaultPose}
+                  disabled={!onReturnDefaultPose}
+                  className="min-h-9 px-3 py-2 text-[11px] tracking-[0.1em] font-semibold uppercase rounded transition-colors disabled:opacity-45 disabled:cursor-not-allowed"
+                  style={{
+                    background: 'rgba(220, 38, 38, 0.34)',
+                    border: '1px solid rgba(248, 113, 113, 0.62)',
+                    color: 'rgba(254, 226, 226, 0.95)',
+                  }}
+                  title="Clear joint tinker overrides and reset to the app's default pose"
+                >
+                  Default
+                </button>
+              </>
             ) : null}
 
             {onUndo ? (
@@ -4390,7 +4765,10 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
             {onMovementTogglesChange ? (
               <button
                 type="button"
-                onClick={() => setShowRefineMenu((prev) => !prev)}
+                onClick={() => {
+                  setShowRefineMenu((prev) => !prev);
+                  setShowExportMenu(false);
+                }}
                 className="min-h-9 px-3 py-2 text-[11px] tracking-[0.1em] font-semibold uppercase rounded transition-colors"
                 style={{
                   background: showRefineMenu ? 'rgba(16, 88, 56, 0.34)' : 'rgba(88, 82, 108, 0.28)',
@@ -4419,27 +4797,194 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
 
             <button
               type="button"
-              onClick={() =>
-                setBodyMasksEnabled((prev) => {
-                  const next = !prev;
-                  if (!next) {
-                    setActiveMaskEditorJointId(null);
-                  }
-                  return next;
-                })
-              }
+              data-testid="grid-export-toggle"
+              onClick={() => {
+                setShowExportMenu((prev) => !prev);
+                setShowRefineMenu(false);
+              }}
               className="min-h-9 px-3 py-2 text-[11px] tracking-[0.1em] font-semibold uppercase rounded transition-colors"
               style={{
-                background: bodyMasksEnabled ? 'rgba(16, 88, 56, 0.34)' : 'rgba(88, 82, 108, 0.28)',
-                border: bodyMasksEnabled ? '1px solid rgba(74, 222, 128, 0.62)' : '1px solid rgba(158, 150, 184, 0.62)',
+                background: showExportMenu ? 'rgba(90, 56, 170, 0.34)' : 'rgba(88, 82, 108, 0.28)',
+                border: showExportMenu ? '1px solid rgba(168, 85, 247, 0.62)' : '1px solid rgba(158, 150, 184, 0.62)',
+                color: 'rgba(232, 228, 243, 0.95)',
+                opacity: exportBusy ? 0.75 : 1,
+              }}
+              disabled={exportBusy !== null}
+              title="Export image, animation JSON, or video"
+            >
+              Export {showExportMenu ? 'On' : 'Off'}
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setMaskControlsVisible((prev) => !prev)}
+              className="min-h-9 px-3 py-2 text-[11px] tracking-[0.1em] font-semibold uppercase rounded transition-colors"
+              style={{
+                background: maskControlsVisible ? 'rgba(16, 88, 56, 0.34)' : 'rgba(88, 82, 108, 0.28)',
+                border: maskControlsVisible ? '1px solid rgba(74, 222, 128, 0.62)' : '1px solid rgba(158, 150, 184, 0.62)',
                 color: 'rgba(232, 228, 243, 0.95)',
               }}
-              title={`Toggle body-part masks (${loadedBodyMaskCount} loaded)`}
+              title={`Toggle mask controls visibility (${loadedBodyMaskCount} loaded)`}
             >
-              Masks {bodyMasksEnabled ? 'On' : 'Off'}
+              Mask Controls {maskControlsVisible ? 'On' : 'Off'}
             </button>
 
           </div>
+
+          {showExportMenu ? (
+            <div
+              data-testid="grid-export-menu"
+              className="absolute border rounded shadow-xl backdrop-blur-sm"
+              style={{
+                top: `${gridRefineTop + 44}px`,
+                left: `${UI_INSET}px`,
+                zIndex: 74,
+                width: '320px',
+                background: CONSOLE_PANEL_BACKGROUND,
+                borderColor: 'rgba(158, 150, 184, 0.5)',
+              }}
+            >
+              <div className="px-3 py-2 border-b border-violet-200/20 flex items-center justify-between gap-2">
+                <span className="text-[10px] tracking-[0.16em] uppercase text-violet-100/90 font-semibold">
+                  Export
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setShowExportMenu(false)}
+                  className="min-h-7 px-2 py-1 text-[10px] border border-white/15 rounded text-zinc-100 hover:bg-white/10 transition-colors"
+                >
+                  Close
+                </button>
+              </div>
+
+              <div className="px-3 py-2.5 space-y-3">
+                <div className="space-y-1.5">
+                  <div className="text-[10px] tracking-[0.12em] uppercase text-zinc-300/90 font-semibold">
+                    Image
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <select
+                      value={exportImageFormat}
+                      onChange={(event) => setExportImageFormat(event.target.value as 'png' | 'jpeg' | 'webp')}
+                      className="min-h-8 px-2 py-1 text-[10px] border border-white/15 rounded bg-zinc-950/70 text-zinc-100"
+                      disabled={exportBusy !== null}
+                    >
+                      <option value="png">PNG</option>
+                      <option value="jpeg">JPEG</option>
+                      <option value="webp">WEBP</option>
+                    </select>
+                    <input
+                      type="number"
+                      min={0.1}
+                      max={1}
+                      step={0.05}
+                      value={exportImageQuality}
+                      onChange={(event) => setExportImageQuality(clamp(Number(event.target.value) || 0.9, 0.1, 1))}
+                      className="w-20 min-h-8 bg-zinc-950/70 border border-white/15 rounded px-2 py-1 text-[10px] text-zinc-100 disabled:opacity-45 disabled:cursor-not-allowed"
+                      disabled={exportBusy !== null || exportImageFormat === 'png'}
+                      title="Quality (JPEG/WEBP only)"
+                    />
+                    <button
+                      type="button"
+                      data-testid="export-image-download"
+                      onClick={handleExportImageClick}
+                      disabled={exportBusy !== null}
+                      className="flex-1 min-h-8 px-2.5 py-1.5 text-[10px] tracking-[0.06em] uppercase border rounded transition-colors disabled:opacity-45 disabled:cursor-not-allowed hover:bg-white/10"
+                      style={{
+                        borderColor: 'rgba(255, 255, 255, 0.16)',
+                        color: 'rgba(228, 228, 235, 0.94)',
+                        background: 'rgba(33, 37, 52, 0.38)',
+                      }}
+                    >
+                      Download
+                    </button>
+                  </div>
+                </div>
+
+                <div className="h-px bg-white/10" />
+
+                <div className="space-y-1.5">
+                  <div className="text-[10px] tracking-[0.12em] uppercase text-zinc-300/90 font-semibold">
+                    Animation
+                  </div>
+                  <button
+                    type="button"
+                    data-testid="export-animation-json-download"
+                    onClick={handleExportAnimationJsonClick}
+                    disabled={exportBusy !== null || !keyframeFrames?.length}
+                    className="w-full min-h-8 px-2.5 py-1.5 text-[10px] tracking-[0.06em] uppercase border rounded transition-colors disabled:opacity-45 disabled:cursor-not-allowed hover:bg-white/10"
+                    style={{
+                      borderColor: 'rgba(255, 255, 255, 0.16)',
+                      color: 'rgba(228, 228, 235, 0.94)',
+                      background: 'rgba(33, 37, 52, 0.38)',
+                    }}
+                    title={keyframeFrames?.length ? 'Download timeline keyframes + settings as JSON' : 'Add a keyframe to enable animation export'}
+                  >
+                    Download JSON
+                  </button>
+                </div>
+
+                <div className="h-px bg-white/10" />
+
+                <div className="space-y-1.5">
+                  <div className="text-[10px] tracking-[0.12em] uppercase text-zinc-300/90 font-semibold">
+                    Video
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      min={1}
+                      max={120}
+                      step={1}
+                      value={exportVideoFpsOverride ?? ''}
+                      onChange={(event) => {
+                        const raw = event.target.value.trim();
+                        if (!raw) {
+                          setExportVideoFpsOverride(null);
+                          return;
+                        }
+                        const next = Math.round(Number(raw));
+                        setExportVideoFpsOverride(Number.isFinite(next) ? clamp(next, 1, 120) : null);
+                      }}
+                      placeholder={`${Math.max(1, Math.round(fps ?? 24))}`}
+                      className="w-20 min-h-8 bg-zinc-950/70 border border-white/15 rounded px-2 py-1 text-[10px] text-zinc-100 placeholder:text-zinc-500 disabled:opacity-45 disabled:cursor-not-allowed"
+                      disabled={exportBusy !== null}
+                      title="FPS override (blank = current FPS)"
+                    />
+                    <button
+                      type="button"
+                      data-testid="export-video-webm-download"
+                      onClick={() => void handleExportTimelineVideoClick({ format: 'webm' })}
+                      disabled={exportBusy !== null || !samplePoseForFrame}
+                      className="flex-1 min-h-8 px-2.5 py-1.5 text-[10px] tracking-[0.06em] uppercase border rounded transition-colors disabled:opacity-45 disabled:cursor-not-allowed hover:bg-white/10"
+                      style={{
+                        borderColor: 'rgba(255, 255, 255, 0.16)',
+                        color: 'rgba(228, 228, 235, 0.94)',
+                        background: 'rgba(33, 37, 52, 0.38)',
+                      }}
+                      title={samplePoseForFrame ? 'Record the current keyframe range as a video (WebM)' : 'Video export requires timeline sampling'}
+                    >
+                      Download WebM
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void handleExportTimelineVideoClick({ format: 'mp4' })}
+                      disabled={exportBusy !== null || !samplePoseForFrame}
+                      className="min-h-8 px-2.5 py-1.5 text-[10px] tracking-[0.06em] uppercase border rounded transition-colors disabled:opacity-45 disabled:cursor-not-allowed hover:bg-white/10"
+                      style={{
+                        borderColor: 'rgba(255, 255, 255, 0.16)',
+                        color: 'rgba(228, 228, 235, 0.94)',
+                        background: 'rgba(33, 37, 52, 0.38)',
+                      }}
+                      title="MP4 export (falls back to WebM if unsupported)"
+                    >
+                      MP4
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          ) : null}
 
           {onReturnDefaultPose ? (
             <button

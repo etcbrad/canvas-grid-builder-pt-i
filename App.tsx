@@ -1412,6 +1412,43 @@ const App: React.FC = () => {
     segmentIkTweenMap,
   ]);
 
+  const samplePoseForFrame = useCallback((frame: number): SkeletonRotations => {
+    const clip = clipRef.current;
+    const safeFrame = Math.max(0, Math.round(Number.isFinite(frame) ? frame : 0));
+    try {
+      return sampleIkTweenPreviewPose({
+        clip,
+        currentFrame: safeFrame,
+        easingFn: easings[easing],
+        segmentInterpolationFrames: interpolationFramesBySegment,
+        segmentIkTweenMap,
+        bitruviusData: modelData,
+        canvasCenter: [0, 0],
+        rootTransform: {
+          x: effectiveMovementToggles.rootX ?? 0,
+          y: effectiveMovementToggles.rootY ?? 0,
+          rotate: effectiveMovementToggles.rootRotate ?? 0,
+        },
+        ikEngineEnabled: coreModules.ik_engine,
+      });
+    } catch {
+      try {
+        return clip.sampleFrame(safeFrame);
+      } catch {
+        return rotations;
+      }
+    }
+  }, [
+    coreModules.ik_engine,
+    easing,
+    effectiveMovementToggles.rootRotate,
+    effectiveMovementToggles.rootX,
+    effectiveMovementToggles.rootY,
+    interpolationFramesBySegment,
+    rotations,
+    segmentIkTweenMap,
+  ]);
+
   const displayedRotations = coreModules.animation_engine ? playbackPreviewRotations : rotations;
 
   const renderGameTextState = useMemo(() => {
@@ -2389,6 +2426,7 @@ const App: React.FC = () => {
           onFrameCountChange={animationControlsDisabled ? undefined : handleFrameCountChange}
           onEasingChange={animationControlsDisabled ? undefined : handleEasingChange}
           keyframePoseMap={keyframePoseMap}
+          samplePoseForFrame={samplePoseForFrame}
           onSavePoseToFrame={animationControlsDisabled ? undefined : handleSavePoseToFrame}
           onApplyPoseToFrame={animationControlsDisabled ? undefined : handleApplyPoseLibraryToFrame}
           onSwapTimelineFrames={animationControlsDisabled ? undefined : handleSwapKeyframeFrames}

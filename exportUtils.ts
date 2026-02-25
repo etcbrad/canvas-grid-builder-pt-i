@@ -48,7 +48,8 @@ export const exportCanvasAsImage = (
           setTimeout(() => URL.revokeObjectURL(url), 100);
           resolve();
         },
-        `image/${format}${format !== 'png' ? `;quality=${quality}` : ''}`
+        format === 'jpeg' ? 'image/jpeg' : `image/${format}`,
+        format === 'png' ? undefined : quality
       );
     } catch (error) {
       reject(error);
@@ -162,7 +163,8 @@ export const captureCurrentFrame = (
           const url = URL.createObjectURL(blob);
           resolve(url);
         },
-        `image/${format}${format !== 'png' ? `;quality=${quality}` : ''}`
+        format === 'jpeg' ? 'image/jpeg' : `image/${format}`,
+        format === 'png' ? undefined : quality
       );
     } catch (error) {
       reject(error);

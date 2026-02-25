@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { chromium } from "playwright";
+import { chromium, firefox, webkit } from "playwright";
 
 function parseArgs(argv) {
   const args = {
@@ -8,7 +8,9 @@ function parseArgs(argv) {
     iterations: 3,
     pauseMs: 250,
     headless: true,
+    browser: "chromium", // "chromium" | "webkit" | "firefox"
     screenshotDir: "output/web-game",
+    screenshotMode: "canvas", // "canvas" | "page"
     actionsFile: null,
     actionsJson: null,
     click: null,
@@ -29,8 +31,14 @@ function parseArgs(argv) {
     } else if (arg === "--headless" && next) {
       args.headless = next !== "0" && next !== "false";
       i++;
+    } else if (arg === "--browser" && next) {
+      args.browser = next;
+      i++;
     } else if (arg === "--screenshot-dir" && next) {
       args.screenshotDir = next;
+      i++;
+    } else if (arg === "--screenshot-mode" && next) {
+      args.screenshotMode = next;
       i++;
     } else if (arg === "--actions-file" && next) {
       args.actionsFile = next;
@@ -51,6 +59,12 @@ function parseArgs(argv) {
   }
   if (!args.url) {
     throw new Error("--url is required");
+  }
+  if (args.screenshotMode !== "canvas" && args.screenshotMode !== "page") {
+    throw new Error('--screenshot-mode must be "canvas" or "page"');
+  }
+  if (args.browser !== "chromium" && args.browser !== "webkit" && args.browser !== "firefox") {
+    throw new Error('--browser must be "chromium", "webkit", or "firefox"');
   }
   return args;
 }
@@ -227,13 +241,38 @@ class ConsoleErrorTracker {
 async function doChoreography(page, canvas, steps) {
   for (const step of steps) {
     const buttons = new Set(step.buttons || []);
+    const bbox = canvas ? await canvas.boundingBox() : null;
+    if (bbox && (typeof step.mouse_x === "number" || typeof step.mouse_y === "number")) {
+      const x = typeof step.mouse_x === "number" ? step.mouse_x : bbox.width / 2;
+      const y = typeof step.mouse_y === "number" ? step.mouse_y : bbox.height / 2;
+      await page.mouse.move(bbox.x + x, bbox.y + y);
+    }
+    if (typeof step.wheel_delta_x === "number" || typeof step.wheel_delta_y === "number") {
+      const deltaX = Number.isFinite(step.wheel_delta_x) ? step.wheel_delta_x : 0;
+      const deltaY = Number.isFinite(step.wheel_delta_y) ? step.wheel_delta_y : 0;
+      if (typeof step.wheel_selector === "string" && step.wheel_selector.trim()) {
+        await page.evaluate(
+          ({ selector, deltaX, deltaY }) => {
+            const element = document.querySelector(selector);
+            if (!element) return false;
+            const evt = new WheelEvent("wheel", {
+              deltaX,
+              deltaY,
+              bubbles: true,
+              cancelable: true,
+            });
+            element.dispatchEvent(evt);
+            return true;
+          },
+          { selector: step.wheel_selector, deltaX, deltaY }
+        );
+      } else {
+        await page.mouse.wheel(deltaX, deltaY);
+      }
+    }
     for (const button of buttons) {
       if (button === "left_mouse_button" || button === "right_mouse_button") {
-        const bbox = canvas ? await canvas.boundingBox() : null;
         if (!bbox) continue;
-        const x = typeof step.mouse_x === "number" ? step.mouse_x : bbox.width / 2;
-        const y = typeof step.mouse_y === "number" ? step.mouse_y : bbox.height / 2;
-        await page.mouse.move(bbox.x + x, bbox.y + y);
         await page.mouse.down({ button: button === "left_mouse_button" ? "left" : "right" });
       } else if (buttonNameToKey[button]) {
         await page.keyboard.down(buttonNameToKey[button]);
@@ -263,9 +302,17 @@ async function main() {
   const args = parseArgs(process.argv);
   ensureDir(args.screenshotDir);
 
-  const browser = await chromium.launch({
+  const browserType =
+    args.browser === "webkit" ? webkit : args.browser === "firefox" ? firefox : chromium;
+
+  const launchArgs = ["--use-gl=angle", "--use-angle=swiftshader"];
+  if (browserType === chromium) {
+    launchArgs.push("--disable-crash-reporter", "--disable-crashpad", "--no-crash-upload");
+  }
+
+  const browser = await browserType.launch({
     headless: args.headless,
-    args: ["--use-gl=angle", "--use-angle=swiftshader"],
+    args: launchArgs,
   });
   const page = await browser.newPage();
   const consoleErrors = new ConsoleErrorTracker();
@@ -293,6 +340,15 @@ async function main() {
       await page.waitForTimeout(250);
     } catch (err) {
       console.warn("Failed to click selector", args.clickSelector, err);
+      try {
+        await page.evaluate((selector) => {
+          const el = document.querySelector(selector);
+          if (el && typeof el.click === "function") el.click();
+        }, args.clickSelector);
+        await page.waitForTimeout(250);
+      } catch (fallbackErr) {
+        console.warn("Fallback click failed", args.clickSelector, fallbackErr);
+      }
     }
   }
   let steps = null;
@@ -325,7 +381,11 @@ async function main() {
     await sleep(args.pauseMs);
 
     const shotPath = path.join(args.screenshotDir, `shot-${i}.png`);
-    await captureScreenshot(page, canvas, shotPath);
+    if (args.screenshotMode === "page") {
+      await page.screenshot({ path: shotPath, fullPage: true, omitBackground: false, type: "png" });
+    } else {
+      await captureScreenshot(page, canvas, shotPath);
+    }
 
     const text = await page.evaluate(() => {
       if (typeof window.render_game_to_text === "function") {
