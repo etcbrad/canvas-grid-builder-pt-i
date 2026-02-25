@@ -1445,6 +1445,7 @@ const App: React.FC = () => {
     effectiveMovementToggles.rootX,
     effectiveMovementToggles.rootY,
     interpolationFramesBySegment,
+    keyframesVersion,
     rotations,
     segmentIkTweenMap,
   ]);

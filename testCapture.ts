@@ -35,11 +35,13 @@ const testCapture = () => {
   
   // Test capture retrieval
   const retrieved = animationCaptureManager.getCapture(capture.id);
+  if (!retrieved) throw new Error(`getCapture(${capture.id}) returned undefined`);
   console.log('Retrieved capture:', retrieved);
   
   // Test export
   const exported = animationCaptureManager.exportCapture(capture.id);
-  console.log('Exported data length:', exported?.length);
+  if (!exported) throw new Error(`exportCapture(${capture.id}) returned null/undefined`);
+  console.log('Exported data length:', exported.length);
   
   // Test capture list
   const allCaptures = animationCaptureManager.getAllCaptures();

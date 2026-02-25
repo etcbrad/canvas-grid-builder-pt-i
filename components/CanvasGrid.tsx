@@ -24,6 +24,12 @@ import {
 import { exportCanvasAsImage, exportCanvasAsVideo } from '../exportUtils';
 import { applyIkGravityHold, type IkGravityHoldToggles } from '../ikGravityHold';
 import { type ViewModeId } from '../viewModes';
+import { 
+  exportLogicBakedCharacter, 
+  downloadLogicBakedCharacter, 
+  downloadLogicBakedHTML,
+  generateLogicBakedHTML 
+} from '../logicBakedExporter';
 
 
 
@@ -69,6 +75,8 @@ export interface MovementToggles {
 export interface CanvasGridRef {
   exportAsImage: (options?: { format?: 'png' | 'jpeg' | 'webp', quality?: number, filename?: string }) => Promise<void>;
   exportAsVideo: (options?: { duration?: number, fps?: number, format?: 'webm' | 'mp4', quality?: number, filename?: string }) => Promise<void>;
+  exportLogicBaked: (options?: { name?: string; description?: string; includeAnimations?: boolean }) => Promise<void>;
+  exportLogicBakedHTML: (options?: { name?: string; description?: string; width?: number; height?: number; showControls?: boolean }) => Promise<void>;
   getCanvas: () => HTMLCanvasElement | null;
 }
 
@@ -176,6 +184,8 @@ interface IKBackHandle {
   offsetPx: number;
   hitRadiusPx: number;
 }
+
+type GridDockPanelId = 'animate' | 'refine' | 'scene' | 'export' | null;
 
 const DEFAULT_IMAGE_LAYER: ImageLayerState = {
   src: null,
@@ -759,6 +769,7 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
   const backgroundUploadInputRef = useRef<HTMLInputElement>(null);
   const foregroundUploadInputRef = useRef<HTMLInputElement>(null);
   const bodyPartMaskUploadInputRef = useRef<HTMLInputElement>(null);
+  const imperativeHandleRef = useRef<CanvasGridRef | null>(null);
   const rotationsRef = useRef<SkeletonRotations>(currentRotations);
   const lastValidRotationsRef = useRef<SkeletonRotations>(currentRotations);
   const ikSmoothedTargetRef = useRef<{ [chainId: string]: { x: number; y: number } }>({});
@@ -786,9 +797,7 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
   const [cursorPos, setCursorPos] = useState<{ x: number; y: number } | null>(null);
   const [ikTargets, setIkTargets] = useState<{ [chainId: string]: { x: number, y: number } }>({});
   const ikInteractionActive = ikEnabled && interactionMode === "IK";
-  const [showRefineMenu, setShowRefineMenu] = useState(false);
-  const [showAnimationTimeline, setShowAnimationTimeline] = useState(true);
-  const [showExportMenu, setShowExportMenu] = useState(false);
+  const [dockPanel, setDockPanel] = useState<GridDockPanelId>('animate');
   const [exportBusy, setExportBusy] = useState<null | 'image' | 'video' | 'animation'>(null);
   const [exportImageFormat, setExportImageFormat] = useState<'png' | 'jpeg' | 'webp'>('png');
   const [exportImageQuality, setExportImageQuality] = useState(0.9);
@@ -803,6 +812,7 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
   const [timelineScrollIndex, setTimelineScrollIndex] = useState(0);
   const [timelineStepFrames, setTimelineStepFrames] = useState(1);
   const [timelineManualStepMode, setTimelineManualStepMode] = useState(false);
+  const [showAnimationTimeline, setShowAnimationTimeline] = useState(false);
   const [dragFrameSlot, setDragFrameSlot] = useState<number | null>(null);
   const [poseLibraryFrame, setPoseLibraryFrame] = useState<number | null>(null);
   const [poseLibrarySearch, setPoseLibrarySearch] = useState('');
@@ -812,6 +822,8 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
   const [activeDefaultPieceId, setActiveDefaultPieceId] = useState<string | null>(null);
   const [showIkAdvancedControls, setShowIkAdvancedControls] = useState(false);
   const [jointTinkerEnabled, setJointTinkerEnabled] = useState(false);
+  const [showRefineMenu, setShowRefineMenu] = useState(false);
+  const [showExportMenu, setShowExportMenu] = useState(false);
   const jointTinkerActivationSnapshotRef = useRef<{
     rotations: SkeletonRotations;
     jointTinkerLengths: Record<string, number>;
@@ -3033,7 +3045,7 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
     ]
   );
 
-  useImperativeHandle(ref, () => ({
+  const handle = useImperativeHandle(ref, () => ({
     exportAsImage: async (options = {}) => {
       const canvas = canvasRef.current;
       if (!canvas) throw new Error('Canvas not available');
@@ -3042,8 +3054,49 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
     exportAsVideo: async (options = {}) => {
       await handleExportTimelineVideoClick(options);
     },
+    exportLogicBaked: async (options = {}) => {
+      const exportData = exportLogicBakedCharacter(
+        bitruviusData,
+        rotationsRef.current,
+        { x: rootX, y: rootY, rotate: rootRotate },
+        {
+          name: options.name,
+          description: options.description,
+          includeAnimations: options.includeAnimations ?? true,
+          keyframes: keyframePoseMap,
+          solver: ikSolver,
+          mode: interactionMode === 'IK' ? 'ik' : interactionMode === 'FK' ? 'fk' : 'hybrid',
+        }
+      );
+      downloadLogicBakedCharacter(exportData);
+    },
+    exportLogicBakedHTML: async (options = {}) => {
+      const exportData = exportLogicBakedCharacter(
+        bitruviusData,
+        rotationsRef.current,
+        { x: rootX, y: rootY, rotate: rootRotate },
+        {
+          name: options.name,
+          description: options.description,
+          includeAnimations: true,
+          keyframes: keyframePoseMap,
+          solver: ikSolver,
+          mode: interactionMode === 'IK' ? 'ik' : interactionMode === 'FK' ? 'fk' : 'hybrid',
+        }
+      );
+      downloadLogicBakedHTML(exportData, {
+        width: options.width ?? 800,
+        height: options.height ?? 600,
+        showControls: options.showControls ?? true,
+      });
+    },
     getCanvas: () => canvasRef.current,
-  }), [handleExportTimelineVideoClick]);
+  }), [handleExportTimelineVideoClick, bitruviusData, rotationsRef, rootX, rootY, rootRotate, keyframePoseMap, ikSolver, interactionMode]);
+
+  // Assign handle to ref for button access
+  useEffect(() => {
+    imperativeHandleRef.current = handle;
+  }, [handle]);
 
   return (
     <div className="relative overflow-hidden" style={{ width: `${width}px`, height: `${height}px` }}>
@@ -4980,6 +5033,67 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
                     >
                       MP4
                     </button>
+                  </div>
+                </div>
+
+                <div className="h-px bg-white/10" />
+
+                <div className="space-y-1.5">
+                  <div className="text-[10px] tracking-[0.12em] uppercase text-zinc-300/90 font-semibold">
+                    Logic-Baked
+                  </div>
+                  <div className="space-y-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const handle = imperativeHandleRef.current;
+                        if (handle) {
+                          handle.exportLogicBaked({
+                            name: 'Character',
+                            description: 'Exported with physics constants',
+                            includeAnimations: true,
+                          });
+                        }
+                      }}
+                      disabled={exportBusy !== null}
+                      className="w-full min-h-8 px-2.5 py-1.5 text-[10px] tracking-[0.06em] uppercase border rounded transition-colors disabled:opacity-45 disabled:cursor-not-allowed hover:bg-white/10"
+                      style={{
+                        borderColor: 'rgba(255, 255, 255, 0.16)',
+                        color: 'rgba(228, 228, 235, 0.94)',
+                        background: 'rgba(33, 37, 52, 0.38)',
+                      }}
+                      title="Export character with embedded physics constants (~5kb runtime)"
+                    >
+                      Download JSON + Runtime
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const handle = imperativeHandleRef.current;
+                        if (handle) {
+                          handle.exportLogicBakedHTML({
+                            name: 'Character',
+                            description: 'Standalone HTML with physics',
+                            width: 800,
+                            height: 600,
+                            showControls: true,
+                          });
+                        }
+                      }}
+                      disabled={exportBusy !== null}
+                      className="w-full min-h-8 px-2.5 py-1.5 text-[10px] tracking-[0.06em] uppercase border rounded transition-colors disabled:opacity-45 disabled:cursor-not-allowed hover:bg-white/10"
+                      style={{
+                        borderColor: 'rgba(255, 255, 255, 0.16)',
+                        color: 'rgba(228, 228, 235, 0.94)',
+                        background: 'rgba(33, 37, 52, 0.38)',
+                      }}
+                      title="Export as standalone HTML with embedded runtime"
+                    >
+                      Download Standalone HTML
+                    </button>
+                  </div>
+                  <div className="text-[9px] text-zinc-500 mt-2">
+                    Includes physics constants and ~5kb runtime engine
                   </div>
                 </div>
               </div>

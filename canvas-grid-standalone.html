@@ -1,0 +1,930 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Canvas Grid - Standalone</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: rgba(248, 248, 252, 0.94);
+            color: #e8e8f0;
+            overflow: hidden;
+        }
+        
+        #container {
+            width: 100vw;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        #header {
+            background: rgba(18, 16, 24, 0.5);
+            padding: 1rem;
+            border-bottom: 1px solid rgba(158, 150, 184, 0.5);
+            backdrop-filter: blur(10px);
+        }
+        
+        #controls {
+            display: flex;
+            gap: 1rem;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        
+        .control-group {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        
+        label {
+            font-size: 0.875rem;
+            color: rgba(232, 228, 243, 0.95);
+            font-weight: 500;
+        }
+        
+        input[type="range"] {
+            width: 120px;
+            height: 4px;
+            background: rgba(255, 255, 255, 0.15);
+            border-radius: 2px;
+            outline: none;
+            -webkit-appearance: none;
+        }
+        
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 16px;
+            height: 16px;
+            background: rgba(74, 222, 128, 0.78);
+            border-radius: 50%;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        
+        input[type="range"]::-webkit-slider-thumb:hover {
+            background: rgba(74, 222, 128, 0.9);
+        }
+        
+        button {
+            background: rgba(26, 32, 46, 0.54);
+            color: rgba(212, 212, 216, 0.92);
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            padding: 0.5rem 1rem;
+            border-radius: 0.375rem;
+            cursor: pointer;
+            font-size: 0.875rem;
+            transition: all 0.2s;
+        }
+        
+        button:hover {
+            background: rgba(34, 40, 54, 0.62);
+            border-color: rgba(255, 255, 255, 0.25);
+        }
+        
+        button.active {
+            background: rgba(16, 88, 56, 0.34);
+            border-color: rgba(74, 222, 128, 0.62);
+            color: rgba(236, 253, 245, 0.95);
+        }
+        
+        #canvas-container {
+            flex: 1;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        #canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            cursor: crosshair;
+        }
+        
+        #info {
+            position: absolute;
+            top: 1rem;
+            right: 1rem;
+            background: rgba(18, 16, 24, 0.84);
+            padding: 1rem;
+            border-radius: 0.5rem;
+            border: 1px solid rgba(158, 150, 184, 0.72);
+            backdrop-filter: blur(10px);
+            font-size: 0.875rem;
+            max-width: 200px;
+        }
+        
+        .info-row {
+            margin-bottom: 0.5rem;
+            display: flex;
+            justify-content: space-between;
+        }
+        
+        .info-label {
+            color: rgba(232, 228, 243, 0.95);
+        }
+        
+        .info-value {
+            color: rgba(232, 228, 243, 0.95);
+            font-weight: 500;
+        }
+    </style>
+</head>
+<body>
+    <div id="container">
+        <div id="header">
+            <div id="controls">
+                <div class="control-group">
+                    <label>Grid:</label>
+                    <button id="toggleGrid" class="active">Show</button>
+                </div>
+                <div class="control-group">
+                    <label>Rings:</label>
+                    <button id="toggleRings" class="active">Show</button>
+                </div>
+                <div class="control-group">
+                    <label>Head Grid:</label>
+                    <button id="toggleHeadGrid" class="active">Show</button>
+                </div>
+                <div class="control-group">
+                    <label>Finger Grid:</label>
+                    <button id="toggleFingerGrid" class="active">Show</button>
+                </div>
+                <div class="control-group">
+                    <label>Model Scale:</label>
+                    <input type="range" id="modelScale" min="0.5" max="2" step="0.1" value="1">
+                    <span id="modelScaleValue">1.0</span>
+                </div>
+                <div class="control-group">
+                    <button id="resetPose">Reset Pose</button>
+                </div>
+                <div class="control-group">
+                    <button id="randomPose">Random Pose</button>
+                </div>
+                <div class="control-group">
+                    <button id="resetView">Reset View</button>
+                </div>
+            </div>
+        </div>
+        <div id="canvas-container">
+            <canvas id="canvas"></canvas>
+            <div id="info">
+                <div class="info-row">
+                    <span class="info-label">FPS:</span>
+                    <span class="info-value" id="fps">60</span>
+                </div>
+                <div class="info-row">
+                    <span class="info-label">Mouse:</span>
+                    <span class="info-value" id="mousePos">0, 0</span>
+                </div>
+                <div class="info-row">
+                    <span class="info-label">Joint:</span>
+                    <span class="info-value" id="hoveredJoint">None</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Utility functions
+        const d2r = (deg) => deg * Math.PI / 180;
+        const r2d = (rad) => rad * 180 / Math.PI;
+        const normA = (angle) => ((angle % 360) + 360) % 360;
+        const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+        const lerp = (a, b, t) => a + (b - a) * t;
+
+        // Joint definitions
+        const JOINT_DEFS = {
+            root:       { parent: null,          pivot: [0, 0],    color: "#000000", label: "Root"       },
+            pelvis:     { parent: "root",        pivot: [0, 0],    color: "#888888", label: "Pelvis"     },
+            torso_base: { parent: "pelvis",      pivot: [0, 0],    color: "#666666", label: "Torso Base" },
+            xiphoid:    { parent: "torso_base",  pivot: [0, -20],  color: "#aaaaaa", label: "Spine_A"    },
+            spine_b:    { parent: "xiphoid",     pivot: [0, -73],  color: "#999999", label: "Spine_B"    },
+            collar:     { parent: "spine_b",     pivot: [0, -13],  color: "#333333", label: "Collar_Joint" },
+            neck:       { parent: "collar",      pivot: [0, 0],    color: "#777777", label: "Neck_A"      },
+            nose:       { parent: "neck",        pivot: [0, -24],  color: "#444444", label: "Nose"        },
+            head:       { parent: "nose",        pivot: [0, -10],  color: "#888888", label: "Cranium"    },
+
+            l_shoulder: { parent: "collar",      pivot: [-34, 0],  color: "#aaaaaa", label: "Arm_A_L"    },
+            l_elbow:    { parent: "l_shoulder",  pivot: [-106, 0], color: "#aaaaaa", label: "Arm_B_L"    },
+            l_palm:     { parent: "l_elbow",     pivot: [-75, 0],  color: "#777777", label: "Hand_A_L"   },
+
+            r_shoulder: { parent: "collar",      pivot: [34, 0],   color: "#aaaaaa", label: "Arm_A_R"    },
+            r_elbow:    { parent: "r_shoulder",  pivot: [106, 0],  color: "#aaaaaa", label: "Arm_B_R"    },
+            r_palm:     { parent: "r_elbow",     pivot: [75, 0],   color: "#777777", label: "Hand_A_R"   },
+
+            l_hip:      { parent: "pelvis",      pivot: [-11, 0],  color: "#aaaaaa", label: "Leg_A_L"    },
+            l_knee:     { parent: "l_hip",       pivot: [0, 148],  color: "#aaaaaa", label: "Leg_B_L"    },
+            l_heel:     { parent: "l_knee",      pivot: [0, 95],   color: "#777777", label: "Foot_A_L"   },
+
+            r_hip:      { parent: "pelvis",      pivot: [11, 0],   color: "#aaaaaa", label: "Leg_A_R"    },
+            r_knee:     { parent: "r_hip",       pivot: [0, 148],  color: "#aaaaaa", label: "Leg_B_R"    },
+            r_heel:     { parent: "r_knee",      pivot: [0, 95],   color: "#777777", label: "Foot_A_R"   },
+        };
+
+        // Shape definitions
+        const SHAPES = {
+            torso: { type: "torso" },
+            waist: { type: "waist", r: 20 },
+            collar: { type: "collar" },
+            neck: { type: "neck" },
+            l_upper_arm: { type: "arm", len: 106, rPivot: 8, rTip: 6, dir: -1 },
+            l_forearm: { type: "arm", len: 75, rPivot: 6, rTip: 5, dir: -1 },
+            l_hand: { type: "hand", r: 8, rt: 4, dir: -1 },
+            r_upper_arm: { type: "arm", len: 106, rPivot: 8, rTip: 6, dir: 1 },
+            r_forearm: { type: "arm", len: 75, rPivot: 6, rTip: 5, dir: 1 },
+            r_hand: { type: "hand", r: 8, rt: 4, dir: 1 },
+            l_thigh: { type: "leg", len: 148, rTop: 10, rBot: 8 },
+            l_shin: { type: "leg", len: 95, rTop: 8, rBot: 6 },
+            l_foot: { type: "foot", len: 25, r: 6 },
+            r_thigh: { type: "leg", len: 148, rTop: 10, rBot: 8 },
+            r_shin: { type: "leg", len: 95, rTop: 8, rBot: 6 },
+            r_foot: { type: "foot", len: 25, r: 6 },
+        };
+
+        // Drawing utilities
+        const torsoHeart = (ctx) => {
+            ctx.beginPath();
+            ctx.moveTo(0, -20);
+            ctx.bezierCurveTo(-25, -45, -55, -35, -55, -15);
+            ctx.bezierCurveTo(-55, 5, -35, 25, 0, 60);
+            ctx.bezierCurveTo(35, 25, 55, 5, 55, -15);
+            ctx.bezierCurveTo(55, -35, 25, -45, 0, -20);
+            ctx.closePath();
+        };
+
+        const waistCircle = (ctx, radius = 20) => {
+            ctx.beginPath();
+            ctx.arc(0, 0, radius, 0, Math.PI * 2);
+            ctx.closePath();
+        };
+
+        const collarShape = (ctx) => {
+            ctx.beginPath();
+            ctx.ellipse(0, 0, 40, 12, 0, 0, Math.PI * 2);
+            ctx.closePath();
+        };
+
+        const neckShape = (ctx) => {
+            ctx.beginPath();
+            ctx.ellipse(0, 0, 12, 8, 0, 0, Math.PI * 2);
+            ctx.closePath();
+        };
+
+        const armBlade = (ctx, len, rPivot, rTip, dir) => {
+            ctx.beginPath();
+            ctx.moveTo(0, -rPivot);
+            ctx.lineTo(-len * 0.3, rPivot);
+            ctx.lineTo(len * dir, rTip);
+            ctx.lineTo(len * dir * 0.7, -rTip);
+            ctx.closePath();
+        };
+
+        const handShape = (ctx, r, rt, dir) => {
+            ctx.beginPath();
+            ctx.moveTo(0, -r);
+            ctx.lineTo(-r * 0.8, 0);
+            ctx.lineTo(0, r);
+            ctx.lineTo(r * dir * 0.6, rt);
+            ctx.lineTo(r * dir * 1.2, rt * 0.5);
+            ctx.lineTo(r * dir, 0);
+            ctx.lineTo(r * dir * 1.2, -rt * 0.5);
+            ctx.lineTo(r * dir * 0.6, -rt);
+            ctx.closePath();
+        };
+
+        const legCapsule = (ctx, len, rTop, rBot) => {
+            ctx.beginPath();
+            ctx.moveTo(-rTop, 0);
+            ctx.lineTo(-rTop, -len * 0.3);
+            ctx.arc(0, -len * 0.3, rTop, Math.PI, 0);
+            ctx.lineTo(rBot, len * 0.3);
+            ctx.arc(0, len * 0.3, rBot, 0, Math.PI);
+            ctx.closePath();
+        };
+
+        const footSpike = (ctx, len, r) => {
+            ctx.beginPath();
+            ctx.moveTo(-r, 0);
+            ctx.lineTo(-r * 0.5, len * 0.3);
+            ctx.lineTo(0, len);
+            ctx.lineTo(r * 0.5, len * 0.3);
+            ctx.lineTo(r, 0);
+            ctx.closePath();
+        };
+
+        // FK Engine
+        class FKEngine {
+            constructor() {
+                this.rotations = {};
+                this.initializeRotations();
+            }
+
+            initializeRotations() {
+                Object.keys(JOINT_DEFS).forEach(jointId => {
+                    this.rotations[jointId] = 0;
+                });
+            }
+
+            computeWorld(jointId, canvasCenter) {
+                const joint = JOINT_DEFS[jointId];
+                if (!joint) return { x: 0, y: 0, angle: 0 };
+
+                let x = canvasCenter[0];
+                let y = canvasCenter[1];
+                let angle = 0;
+
+                const chain = [];
+                let currentJoint = joint;
+                while (currentJoint) {
+                    chain.unshift(currentJoint);
+                    currentJoint = JOINT_DEFS[currentJoint.parent];
+                }
+
+                for (const chainJoint of chain) {
+                    const jointAngle = this.rotations[chainJoint.label] || 0;
+                    angle += jointAngle;
+                    
+                    const cos = Math.cos(d2r(angle));
+                    const sin = Math.sin(d2r(angle));
+                    
+                    x += chainJoint.pivot[0] * cos - chainJoint.pivot[1] * sin;
+                    y += chainJoint.pivot[0] * sin + chainJoint.pivot[1] * cos;
+                }
+
+                return { x, y, angle };
+            }
+
+            setRotation(jointId, angle) {
+                this.rotations[jointId] = normA(angle);
+            }
+
+            resetPose() {
+                this.initializeRotations();
+            }
+
+            randomPose() {
+                Object.keys(this.rotations).forEach(jointId => {
+                    this.rotations[jointId] = Math.random() * 60 - 30;
+                });
+            }
+        }
+
+        // Vitruvian Grid System
+        class VitruvianGrid {
+            constructor(width, height) {
+                this.width = width;
+                this.height = height;
+                this.centerX = width / 2;
+                this.centerY = height / 2;
+                
+                // Vitruvian model proportions
+                this.totalHeight = 1;
+                this.navelRatio = 0.618;
+                this.halfWidth = this.totalHeight / 2;
+                this.headHeight = this.totalHeight / 8;
+                this.crownY = this.totalHeight;
+                this.chinY = this.crownY - this.headHeight;
+                this.navelY = this.totalHeight * this.navelRatio;
+                
+                // Calculate grid scale to fit circle within viewport
+                // Circle radius = navelY, so diameter = 2 * navelY
+                const maxCircleSize = Math.min(width, height) * 0.9; // 90% of viewport to ensure it's never cut off
+                this.gridScale = maxCircleSize / (2 * this.navelY);
+                
+                this.headUnit = this.headHeight * this.gridScale;
+                this.gridTileHeight = this.totalHeight;
+                
+                // Center the square on screen (square center = viewport center, moved down 50%)
+                this.xOffset = this.centerX;
+                this.yOffset = this.centerY + (this.totalHeight * 0.5 * this.gridScale); // Move down 50%
+                
+                // User pan offset (starts centered)
+                this.userOffsetX = 0;
+                this.userOffsetY = 0;
+            }
+
+            worldToScreen(x, y) {
+                return {
+                    x: this.xOffset + x * this.gridScale + this.userOffsetX,
+                    y: this.yOffset - y * this.gridScale + this.userOffsetY
+                };
+            }
+
+            screenToWorld(x, y) {
+                return {
+                    x: (x - this.xOffset - this.userOffsetX) / this.gridScale,
+                    y: -(y - this.yOffset - this.userOffsetY) / this.gridScale
+                };
+            }
+
+            setUserOffset(x, y) {
+                this.userOffsetX = x;
+                this.userOffsetY = y;
+            }
+
+            drawGrid(ctx) {
+                const majorGridSize = 8;
+                const minorGridSize = 2;
+                
+                // Draw square boundary
+                const squareTopLeft = this.worldToScreen(-this.halfWidth, 0);
+                const squareBottomRight = this.worldToScreen(this.halfWidth, this.totalHeight);
+                
+                ctx.strokeStyle = 'rgba(148, 163, 184, 0.72)';
+                ctx.lineWidth = 1.6;
+                ctx.beginPath();
+                ctx.rect(squareTopLeft.x, squareTopLeft.y, 
+                        squareBottomRight.x - squareTopLeft.x, 
+                        squareBottomRight.y - squareTopLeft.y);
+                ctx.stroke();
+
+                // Minor grid
+                ctx.strokeStyle = 'rgba(148, 163, 184, 0.34)';
+                ctx.lineWidth = 0.6;
+
+                for (let i = 0; i <= majorGridSize; i += minorGridSize) {
+                    const y = this.worldToScreen(-this.halfWidth, i * this.headHeight).y;
+                    ctx.beginPath();
+                    ctx.moveTo(squareTopLeft.x, y);
+                    ctx.lineTo(squareBottomRight.x, y);
+                    ctx.stroke();
+                }
+
+                for (let i = 0; i <= majorGridSize; i += minorGridSize) {
+                    const x = this.worldToScreen(-this.halfWidth + i * this.headHeight, 0).x;
+                    ctx.beginPath();
+                    ctx.moveTo(x, squareTopLeft.y);
+                    ctx.lineTo(x, squareBottomRight.y);
+                    ctx.stroke();
+                }
+
+                // Major grid
+                ctx.strokeStyle = 'rgba(148, 163, 184, 0.72)';
+                ctx.lineWidth = 1;
+
+                for (let i = 0; i <= majorGridSize; i++) {
+                    const y = this.worldToScreen(-this.halfWidth, i * this.headHeight).y;
+                    ctx.beginPath();
+                    ctx.moveTo(squareTopLeft.x, y);
+                    ctx.lineTo(squareBottomRight.x, y);
+                    ctx.stroke();
+                }
+
+                for (let i = 0; i <= majorGridSize; i++) {
+                    const x = this.worldToScreen(-this.halfWidth + i * this.headHeight, 0).x;
+                    ctx.beginPath();
+                    ctx.moveTo(x, squareTopLeft.y);
+                    ctx.lineTo(x, squareBottomRight.y);
+                    ctx.stroke();
+                }
+
+                // Center line
+                ctx.strokeStyle = 'rgba(239, 68, 68, 0.75)';
+                ctx.lineWidth = 1.4;
+                ctx.setLineDash([6, 4]);
+                
+                ctx.beginPath();
+                ctx.moveTo(this.worldToScreen(0, 0).x, squareTopLeft.y);
+                ctx.lineTo(this.worldToScreen(0, 0).x, squareBottomRight.y);
+                ctx.stroke();
+                
+                ctx.setLineDash([]);
+            }
+
+            drawRings(ctx) {
+                const ringColors = ['rgba(44, 128, 135, 0.7)', 'rgba(168, 85, 247, 0.75)'];
+                const ringRadii = [1, 2, 3, 4, 6, 8];
+                
+                ringRadii.forEach((radius, index) => {
+                    const worldRadius = radius * this.headHeight / this.gridScale;
+                    const center = this.worldToScreen(0, this.navelY);
+                    const screenRadius = worldRadius * this.gridScale;
+                    
+                    ctx.strokeStyle = ringColors[index % ringColors.length];
+                    ctx.lineWidth = index === 0 ? 1.6 : 1;
+                    ctx.beginPath();
+                    ctx.arc(center.x, center.y, screenRadius, 0, Math.PI * 2);
+                    ctx.stroke();
+                });
+            }
+
+            drawHeadGrid(ctx) {
+                const headSize = this.headHeight;
+                const divisions = 8;
+                
+                // Head grid lines
+                ctx.strokeStyle = 'rgba(186, 64, 141, 0.68)';
+                ctx.lineWidth = 1;
+
+                // Vertical lines
+                for (let i = 0; i <= divisions; i++) {
+                    const x = this.worldToScreen(-0.5 + i * (headSize / divisions), 8).x;
+                    const topY = this.worldToScreen(0, 7.5).y;
+                    const bottomY = this.worldToScreen(0, 8.5).y;
+                    
+                    ctx.beginPath();
+                    ctx.moveTo(x, topY);
+                    ctx.lineTo(x, bottomY);
+                    ctx.stroke();
+                }
+
+                // Horizontal lines
+                ctx.strokeStyle = 'rgba(92, 103, 255, 0.64)';
+                
+                for (let i = 0; i <= divisions; i++) {
+                    const y = this.worldToScreen(0, 8 + i * (headSize / divisions)).y;
+                    const leftX = this.worldToScreen(-0.5, 0).x;
+                    const rightX = this.worldToScreen(0.5, 0).x;
+                    
+                    ctx.beginPath();
+                    ctx.moveTo(leftX, y);
+                    ctx.lineTo(rightX, y);
+                    ctx.stroke();
+                }
+            }
+
+            drawFingerGrid(ctx) {
+                const palmCenter = this.computeWorld('l_palm', [this.width / 2, this.height / 2]);
+                const fingerLength = this.headHeight * 0.3;
+                const divisions = 4;
+                
+                ctx.strokeStyle = 'rgba(116, 121, 42, 0.35)';
+                ctx.lineWidth = 0.6;
+
+                for (let i = 0; i <= divisions; i++) {
+                    const t = i / divisions;
+                    const y = palmCenter.y + t * fingerLength;
+                    
+                    ctx.beginPath();
+                    ctx.moveTo(palmCenter.x - fingerLength/3, y);
+                    ctx.lineTo(palmCenter.x + fingerLength/3, y);
+                    ctx.stroke();
+                }
+            }
+
+            computeWorld(jointId, canvasCenter) {
+                return fkEngine.computeWorld(jointId, canvasCenter);
+            }
+        }
+
+        // Renderer
+        class Renderer {
+            constructor(ctx, width, height) {
+                this.ctx = ctx;
+                this.width = width;
+                this.height = height;
+                this.grid = new VitruvianGrid(width, height);
+            }
+
+            drawShape(shape, worldPos, modelScale = 1) {
+                this.ctx.save();
+                this.ctx.translate(worldPos.x, worldPos.y);
+                this.ctx.rotate(d2r(worldPos.angle));
+                this.ctx.scale(modelScale, modelScale);
+
+                switch (shape.type) {
+                    case "torso":
+                        torsoHeart(this.ctx);
+                        break;
+                    case "waist":
+                        waistCircle(this.ctx, shape.r || 20);
+                        break;
+                    case "collar":
+                        collarShape(this.ctx);
+                        break;
+                    case "neck":
+                        neckShape(this.ctx);
+                        break;
+                    case "arm":
+                        armBlade(this.ctx, shape.len, shape.rPivot, shape.rTip, shape.dir);
+                        break;
+                    case "hand":
+                        handShape(this.ctx, shape.r, shape.rt, shape.dir);
+                        break;
+                    case "leg":
+                        legCapsule(this.ctx, shape.len, shape.rTop, shape.rBot);
+                        break;
+                    case "foot":
+                        footSpike(this.ctx, shape.len, shape.r);
+                        break;
+                }
+
+                this.ctx.fillStyle = 'rgba(232, 228, 243, 0.9)';
+                this.ctx.fill();
+                this.ctx.strokeStyle = 'rgba(0, 0, 0, 0.5)';
+                this.ctx.lineWidth = 1;
+                this.ctx.stroke();
+                this.ctx.restore();
+            }
+
+            drawModel(modelScale = 1) {
+                const canvasCenter = [this.width / 2, this.height / 2];
+
+                // Draw bones
+                Object.keys(JOINT_DEFS).forEach(jointId => {
+                    const joint = JOINT_DEFS[jointId];
+                    if (!joint.parent) return;
+
+                    const parentPos = this.grid.computeWorld(joint.parent, canvasCenter);
+                    const jointPos = this.grid.computeWorld(jointId, canvasCenter);
+
+                    this.ctx.strokeStyle = joint.color;
+                    this.ctx.lineWidth = 3 * modelScale;
+                    this.ctx.beginPath();
+                    this.ctx.moveTo(parentPos.x, parentPos.y);
+                    this.ctx.lineTo(jointPos.x, jointPos.y);
+                    this.ctx.stroke();
+                });
+
+                // Draw shapes
+                Object.keys(SHAPES).forEach(shapeId => {
+                    const jointId = this.getJointForShape(shapeId);
+                    if (jointId) {
+                        const worldPos = this.grid.computeWorld(jointId, canvasCenter);
+                        this.drawShape(SHAPES[shapeId], worldPos, modelScale);
+                    }
+                });
+
+                // Draw joints
+                Object.keys(JOINT_DEFS).forEach(jointId => {
+                    const worldPos = this.grid.computeWorld(jointId, canvasCenter);
+                    const joint = JOINT_DEFS[jointId];
+                    
+                    if (jointId === "root") {
+                        this.ctx.fillStyle = "#000000";
+                        this.ctx.beginPath();
+                        this.ctx.arc(worldPos.x, worldPos.y, 5, 0, Math.PI * 2);
+                        this.ctx.fill();
+                    } else if (jointId !== "nose") {
+                        this.ctx.fillStyle = "#222222";
+                        this.ctx.beginPath();
+                        this.ctx.arc(worldPos.x, worldPos.y, 3, 0, Math.PI * 2);
+                        this.ctx.fill();
+                    }
+                });
+            }
+
+            getJointForShape(shapeId) {
+                const shapeToJoint = {
+                    'torso': 'torso_base',
+                    'waist': 'pelvis',
+                    'collar': 'collar',
+                    'neck': 'neck',
+                    'l_upper_arm': 'l_shoulder',
+                    'l_forearm': 'l_elbow',
+                    'l_hand': 'l_palm',
+                    'r_upper_arm': 'r_shoulder',
+                    'r_forearm': 'r_elbow',
+                    'r_hand': 'r_palm',
+                    'l_thigh': 'l_hip',
+                    'l_shin': 'l_knee',
+                    'l_foot': 'l_heel',
+                    'r_thigh': 'r_hip',
+                    'r_shin': 'r_knee',
+                    'r_foot': 'r_heel',
+                };
+                return shapeToJoint[shapeId];
+            }
+
+            render(showGrid, showRings, showHeadGrid, showFingerGrid, modelScale) {
+                // Clear with main app background
+                this.ctx.fillStyle = "rgba(248, 248, 252, 0.94)";
+                this.ctx.fillRect(0, 0, this.width, this.height);
+
+                if (showGrid) this.grid.drawGrid(this.ctx);
+                if (showRings) this.grid.drawRings(this.ctx);
+                if (showHeadGrid) this.grid.drawHeadGrid(this.ctx);
+                if (showFingerGrid) this.grid.drawFingerGrid(this.ctx);
+                
+                this.drawModel(modelScale);
+            }
+
+            setPanOffset(x, y) {
+                this.grid.setUserOffset(x, y);
+            }
+        }
+
+        // Main application
+        class CanvasGridApp {
+            constructor() {
+                this.canvas = document.getElementById('canvas');
+                this.ctx = this.canvas.getContext('2d');
+                this.fkEngine = new FKEngine();
+                this.renderer = new Renderer(this.ctx, window.innerWidth, window.innerHeight - 80);
+                
+                this.showGrid = true;
+                this.showRings = true;
+                this.showHeadGrid = true;
+                this.showFingerGrid = true;
+                this.modelScale = 1.0;
+                
+                this.mousePos = { x: 0, y: 0 };
+                this.hoveredJoint = null;
+                this.isDragging = false;
+                this.dragJoint = null;
+                this.isPanning = false;
+                this.panStart = { x: 0, y: 0 };
+                this.panOffset = { x: 0, y: 0 };
+                
+                this.lastFrameTime = performance.now();
+                this.frameCount = 0;
+                this.fps = 60;
+
+                this.init();
+            }
+
+            init() {
+                this.setupCanvas();
+                this.setupEventListeners();
+                this.animate();
+            }
+
+            setupCanvas() {
+                this.resizeCanvas();
+                window.addEventListener('resize', () => this.resizeCanvas());
+            }
+
+            resizeCanvas() {
+                const container = document.getElementById('canvas-container');
+                this.canvas.width = container.clientWidth;
+                this.canvas.height = container.clientHeight;
+                this.renderer = new Renderer(this.ctx, this.canvas.width, this.canvas.height);
+            }
+
+            setupEventListeners() {
+                // Canvas events
+                this.canvas.addEventListener('mousedown', (e) => this.onMouseDown(e));
+                this.canvas.addEventListener('mousemove', (e) => this.onMouseMove(e));
+                this.canvas.addEventListener('mouseup', (e) => this.onMouseUp(e));
+                this.canvas.addEventListener('mouseleave', (e) => this.onMouseUp(e));
+
+                // Control events
+                document.getElementById('toggleGrid').addEventListener('click', () => {
+                    this.showGrid = !this.showGrid;
+                    document.getElementById('toggleGrid').classList.toggle('active', this.showGrid);
+                });
+
+                document.getElementById('toggleRings').addEventListener('click', () => {
+                    this.showRings = !this.showRings;
+                    document.getElementById('toggleRings').classList.toggle('active', this.showRings);
+                });
+
+                document.getElementById('toggleHeadGrid').addEventListener('click', () => {
+                    this.showHeadGrid = !this.showHeadGrid;
+                    document.getElementById('toggleHeadGrid').classList.toggle('active', this.showHeadGrid);
+                });
+
+                document.getElementById('toggleFingerGrid').addEventListener('click', () => {
+                    this.showFingerGrid = !this.showFingerGrid;
+                    document.getElementById('toggleFingerGrid').classList.toggle('active', this.showFingerGrid);
+                });
+
+                document.getElementById('modelScale').addEventListener('input', (e) => {
+                    this.modelScale = parseFloat(e.target.value);
+                    document.getElementById('modelScaleValue').textContent = this.modelScale.toFixed(1);
+                });
+
+                document.getElementById('resetPose').addEventListener('click', () => {
+                    this.fkEngine.resetPose();
+                });
+
+                document.getElementById('randomPose').addEventListener('click', () => {
+                    this.fkEngine.randomPose();
+                });
+
+                document.getElementById('resetView').addEventListener('click', () => {
+                    this.panOffset = { x: 0, y: 0 };
+                    this.renderer.setPanOffset(0, 0);
+                });
+            }
+
+            onMouseDown(e) {
+                const rect = this.canvas.getBoundingClientRect();
+                const x = e.clientX - rect.left;
+                const y = e.clientY - rect.top;
+
+                // Check for middle mouse button or shift+click for panning
+                if (e.button === 1 || e.shiftKey) {
+                    this.isPanning = true;
+                    this.panStart = { x: e.clientX, y: e.clientY };
+                    this.canvas.style.cursor = 'grabbing';
+                    return;
+                }
+
+                const canvasCenter = [this.canvas.width / 2, this.canvas.height / 2];
+                
+                // Find closest joint
+                let closestJoint = null;
+                let closestDistance = Infinity;
+
+                Object.keys(JOINT_DEFS).forEach(jointId => {
+                    const worldPos = this.fkEngine.computeWorld(jointId, canvasCenter);
+                    const distance = Math.hypot(worldPos.x - x, worldPos.y - y);
+                    
+                    if (distance < closestDistance && distance < 20) {
+                        closestDistance = distance;
+                        closestJoint = jointId;
+                    }
+                });
+
+                if (closestJoint) {
+                    this.isDragging = true;
+                    this.dragJoint = closestJoint;
+                    this.canvas.style.cursor = 'grabbing';
+                }
+            }
+
+            onMouseMove(e) {
+                const rect = this.canvas.getBoundingClientRect();
+                this.mousePos.x = e.clientX - rect.left;
+                this.mousePos.y = e.clientY - rect.top;
+
+                document.getElementById('mousePos').textContent = `${Math.round(this.mousePos.x)}, ${Math.round(this.mousePos.y)}`;
+
+                if (this.isPanning) {
+                    const deltaX = e.clientX - this.panStart.x;
+                    const deltaY = e.clientY - this.panStart.y;
+                    
+                    this.panOffset.x += deltaX;
+                    this.panOffset.y += deltaY;
+                    
+                    this.renderer.setPanOffset(this.panOffset.x, this.panOffset.y);
+                    
+                    this.panStart = { x: e.clientX, y: e.clientY };
+                } else if (this.isDragging && this.dragJoint) {
+                    const canvasCenter = [this.canvas.width / 2, this.canvas.height / 2];
+                    const parentPos = this.fkEngine.computeWorld(JOINT_DEFS[this.dragJoint].parent, canvasCenter);
+                    
+                    const angle = r2d(Math.atan2(this.mousePos.y - parentPos.y, this.mousePos.x - parentPos.x));
+                    this.fkEngine.setRotation(this.dragJoint, angle);
+                } else {
+                    // Find hovered joint
+                    const canvasCenter = [this.canvas.width / 2, this.canvas.height / 2];
+                    let closestJoint = null;
+                    let closestDistance = Infinity;
+
+                    Object.keys(JOINT_DEFS).forEach(jointId => {
+                        const worldPos = this.fkEngine.computeWorld(jointId, canvasCenter);
+                        const distance = Math.hypot(worldPos.x - this.mousePos.x, worldPos.y - this.mousePos.y);
+                        
+                        if (distance < closestDistance && distance < 20) {
+                            closestDistance = distance;
+                            closestJoint = jointId;
+                        }
+                    });
+
+                    this.hoveredJoint = closestJoint;
+                    document.getElementById('hoveredJoint').textContent = this.hoveredJoint ? JOINT_DEFS[this.hoveredJoint].label : 'None';
+                    this.canvas.style.cursor = this.hoveredJoint ? 'grab' : 'crosshair';
+                }
+            }
+
+            onMouseUp(e) {
+                this.isDragging = false;
+                this.dragJoint = null;
+                this.isPanning = false;
+                this.canvas.style.cursor = 'crosshair';
+            }
+
+            updateFPS() {
+                this.frameCount++;
+                const currentTime = performance.now();
+                const deltaTime = currentTime - this.lastFrameTime;
+
+                if (deltaTime >= 1000) {
+                    this.fps = Math.round((this.frameCount * 1000) / deltaTime);
+                    document.getElementById('fps').textContent = this.fps;
+                    this.frameCount = 0;
+                    this.lastFrameTime = currentTime;
+                }
+            }
+
+            animate() {
+                this.renderer.render(
+                    this.showGrid,
+                    this.showRings,
+                    this.showHeadGrid,
+                    this.showFingerGrid,
+                    this.modelScale
+                );
+                
+                this.updateFPS();
+                requestAnimationFrame(() => this.animate());
+            }
+        }
+
+        // Initialize the application
+        const app = new CanvasGridApp();
+        const fkEngine = app.fkEngine;
+    </script>
+</body>
+</html>

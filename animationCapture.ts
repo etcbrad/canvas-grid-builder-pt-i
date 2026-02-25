@@ -1,4 +1,4 @@
-import type { SkeletonRotations, WorldCoords } from './modelData';
+import type { SkeletonRotations } from './modelData';
 import type { RootTransform } from './fkEngine';
 
 export interface AnimationCaptureData {
@@ -38,11 +38,15 @@ export class AnimationCaptureManager {
     frames: AnimationCaptureData[],
     options: AnimationCaptureOptions = {}
   ): AnimationCapture {
+    const resolvedOptions: AnimationCaptureOptions = {
+      ...DEFAULT_CAPTURE_OPTIONS,
+      ...options,
+    };
     const id = `capture_${++this.captureCounter}_${Date.now()}`;
     const capture: AnimationCapture = {
       id,
       name: name.trim() || `Capture ${this.captureCounter}`,
-      frames: frames.filter(frame => this.validateFrame(frame, options)),
+      frames: frames.filter((frame) => this.validateFrame(frame, resolvedOptions)),
       duration: frames.length > 0 ? Math.max(...frames.map(f => f.frame)) : 0,
       createdAt: Date.now(),
     };
@@ -85,7 +89,10 @@ export class AnimationCaptureManager {
     }
   }
 
-  private validateFrame(frame: AnimationCaptureData, options: AnimationCaptureOptions): boolean {
+  private validateFrame(
+    frame: AnimationCaptureData,
+    options: AnimationCaptureOptions
+  ): boolean {
     if (!Number.isFinite(frame.frame) || frame.frame < 0) {
       return false;
     }
@@ -94,7 +101,10 @@ export class AnimationCaptureManager {
       return false;
     }
     
-    if (options.includeWorldPositions && (!frame.worldPositions || typeof frame.worldPositions !== 'object')) {
+    if (
+      options.includeWorldPositions &&
+      (!frame.worldPositions || typeof frame.worldPositions !== 'object')
+    ) {
       return false;
     }
     
