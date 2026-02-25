@@ -11,8 +11,24 @@ import CoreModuleGrid, {
 } from './components/CoreModuleGrid';
 import TimelineStrip from './components/TimelineStrip';
 import OnionSkinControls from './components/OnionSkinControls';
-import { AnimationClip } from 'pose-to-pose-engine';
-import type { PoseKeyframe } from 'pose-to-pose-engine/types';
+
+// Temporary type aliases until pose-to-pose-engine is installed
+interface PoseKeyframe {
+  id: string;
+  frame: number;
+  pose: SkeletonRotations;
+}
+
+interface AnimationClip<T> {
+  keyframes: PoseKeyframe[];
+  duration: number;
+  getKeyframes(): PoseKeyframe[];
+  sampleFrame: (frame: number) => SkeletonRotations;
+  upsertKeyframe: (frame: number, pose: SkeletonRotations) => void;
+  removeKeyframe: (frame: number) => void;
+  getGhostFrames: (options?: { past?: number; future?: number }) => Array<{ frame: number; pose: SkeletonRotations; opacity: number }>;
+}
+
 import { createInterpolator } from './adapters/poseInterpolator';
 import * as easings from './easing';
 import type { EasingFn } from './easing';
@@ -419,7 +435,7 @@ const App: React.FC = () => {
   const [fps, setFps] = useState(24);
   const [viewMode, setViewMode] = useState<ViewModeId>('default');
   const gridViewMode = true;
-  const animationFrameRef = useRef<number>();
+  const animationFrameRef = useRef<number | undefined>(undefined);
   const playbackClockRef = useRef<{
     startTimeMs: number;
     startFrame: number;
