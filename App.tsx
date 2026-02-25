@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { bitruviusData as modelData } from './modelData';
 import { SkeletonRotations } from './modelData';
-import CanvasGrid, { MovementToggles } from './components/CanvasGrid';
+import CanvasGrid, { MovementToggles, type CanvasGridRef } from './components/CanvasGrid';
+import { viewModes, type ViewModeId } from './viewModes';
 import CoreModuleGrid, {
   CoreModuleDefinition,
   CoreModuleId,
@@ -26,6 +27,7 @@ import {
   type SegmentIkTweenMap,
   type SegmentIkTweenSettings,
 } from './animationIkTween';
+import { exportCanvasAsImage, exportCanvasAsVideo, type ExportOptions, type VideoExportOptions } from './exportUtils';
 
 const DEFAULT_ONION = { past: 2, future: 2, enabled: false };
 const VISUAL_MODULES_DEFAULT: VisualModuleState = {
@@ -415,6 +417,7 @@ const App: React.FC = () => {
   });
   const [isPlaying, setIsPlaying] = useState(false);
   const [fps, setFps] = useState(24);
+  const [viewMode, setViewMode] = useState<ViewModeId>('default');
   const gridViewMode = true;
   const animationFrameRef = useRef<number>();
   const playbackClockRef = useRef<{
@@ -440,6 +443,25 @@ const App: React.FC = () => {
   const [historyVersion, setHistoryVersion] = useState(0);
   const rotationGestureHasCheckpointRef = useRef(false);
   const rotationGestureResetTimerRef = useRef<number | null>(null);
+  const canvasGridRef = useRef<CanvasGridRef>(null);
+
+  const handleExportImage = async () => {
+    if (!canvasGridRef.current) return;
+    try {
+      await canvasGridRef.current.exportAsImage({ format: 'png' });
+    } catch (error) {
+      console.error('Export failed:', error);
+    }
+  };
+
+  const handleExportVideo = async () => {
+    if (!canvasGridRef.current) return;
+    try {
+      await canvasGridRef.current.exportAsVideo({ duration: 3, fps: 30, format: 'webm' });
+    } catch (error) {
+      console.error('Video export failed:', error);
+    }
+  };
 
   useEffect(() => {
     return () => {
@@ -1973,6 +1995,29 @@ const App: React.FC = () => {
           >
             RESET
           </button>
+          <button
+            onClick={handleExportImage}
+            className="px-3 py-1 text-[9px] border border-zinc-800 bg-zinc-950 text-zinc-400 rounded hover:bg-zinc-900 transition-colors"
+          >
+            EXPORT IMG
+          </button>
+          <button
+            onClick={handleExportVideo}
+            className="px-3 py-1 text-[9px] border border-zinc-800 bg-zinc-950 text-zinc-400 rounded hover:bg-zinc-900 transition-colors"
+          >
+            EXPORT VID
+          </button>
+          <select
+            value={viewMode}
+            onChange={(e) => setViewMode(e.target.value as ViewModeId)}
+            className="px-3 py-1 text-[9px] border border-zinc-800 bg-zinc-950 text-zinc-400 rounded hover:bg-zinc-900 transition-colors"
+          >
+            {viewModes.map((mode) => (
+              <option key={mode.id} value={mode.id}>
+                {mode.label}
+              </option>
+            ))}
+          </select>
         </div>
       </div>
       )}
@@ -2041,6 +2086,7 @@ const App: React.FC = () => {
 
       <div className="flex-1 w-full relative overflow-hidden flex items-center justify-center p-0">
         <CanvasGrid
+          ref={canvasGridRef}
           width={canvasWidth} height={canvasHeight}
           majorGridSize={64} majorGridColor="rgba(128, 0, 128, 0.32)" majorGridWidth={1}
           minorGridSize={8} minorGridColor="rgba(0, 255, 0, 0.16)" minorGridWidth={0.5}
@@ -2061,6 +2107,7 @@ const App: React.FC = () => {
           canUndo={canUndo}
           canRedo={canRedo}
           movementToggles={effectiveMovementToggles}
+          viewMode={viewMode}
           onMovementTogglesChange={handleMovementTogglesChange}
           onPoseApply={coreModules.interaction_engine ? applyPose : undefined}
           onRotationsChange={coreModules.interaction_engine ? handleRotationsChange : undefined}

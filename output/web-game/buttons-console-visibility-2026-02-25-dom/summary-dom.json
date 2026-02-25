@@ -1,0 +1,32 @@
+{
+  "before": {
+    "controlsLabel": "CONTROLS ON",
+    "buttons": {
+      "Joint Tinker": true,
+      "Timeline Panel": true,
+      "Refine": true,
+      "Masks": true
+    },
+    "timelineRailVisible": false
+  },
+  "afterHide": {
+    "controlsLabel": "CONTROLS OFF",
+    "buttons": {
+      "Joint Tinker": false,
+      "Timeline Panel": false,
+      "Refine": false,
+      "Masks": false
+    },
+    "timelineRailVisible": false
+  },
+  "afterRestore": {
+    "controlsLabel": "CONTROLS ON",
+    "buttons": {
+      "Joint Tinker": true,
+      "Timeline Panel": true,
+      "Refine": true,
+      "Masks": true
+    },
+    "timelineRailVisible": false
+  }
+}

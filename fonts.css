@@ -1,0 +1,7 @@
+
+@import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&family=VT323&family=Silkscreen:wght@400;700&display=swap');
+:root {
+  --font-press: 'Press Start 2P', cursive;
+  --font-vt: 'VT323', monospace;
+  --font-silk: 'Silkscreen', sans-serif;
+}

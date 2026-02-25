@@ -1,4 +1,4 @@
-import React, { useRef, useEffect, useState, useCallback } from 'react';
+import React, { useRef, useEffect, useState, useCallback, forwardRef, useImperativeHandle } from 'react';
 import { r2d, normA, clamp } from '../utils';
 import { BitruviusData, IKActivationStage, IKChain, SkeletonRotations, WorldCoords } from '../modelData';
 import { computeJointWorldForPose } from '../fkEngine';
@@ -21,6 +21,9 @@ import {
   type SegmentIkTweenMap,
   type SegmentIkTweenSettings,
 } from '../animationIkTween';
+import { exportCanvasAsImage, exportCanvasAsVideo } from '../exportUtils';
+import { applyIkGravityHold, type IkGravityHoldToggles } from '../ikGravityHold';
+import { type ViewModeId } from '../viewModes';
 
 
 
@@ -48,6 +51,8 @@ export interface MovementToggles {
   ikUnconstrainedEnabled?: boolean;
   ikProfile?: "base" | "human";
   ikSolver?: "fabrik" | "ccd" | "hybrid";
+  ikGravityArmHoldEnabled?: boolean;
+  ikGravityLegHoldEnabled?: boolean;
   ikSolveMode?: "single_chain" | "limbs_only" | "whole_body_graph";
   legIntentMode?: LegIntentMode;
   humanCounterbalanceEnabled?: boolean;
@@ -59,6 +64,12 @@ export interface MovementToggles {
   poseDirection?: PoseDirection;
   weightShiftLateral?: number;
   weightShiftDepth?: number;
+}
+
+export interface CanvasGridRef {
+  exportAsImage: (options?: { format?: 'png' | 'jpeg' | 'webp', quality?: number, filename?: string }) => Promise<void>;
+  exportAsVideo: (options?: { duration?: number, fps?: number, format?: 'webm' | 'mp4', quality?: number, filename?: string }) => Promise<void>;
+  getCanvas: () => HTMLCanvasElement | null;
 }
 
 interface CanvasGridProps {
@@ -81,6 +92,7 @@ interface CanvasGridProps {
   ikEnabled?: boolean;
   interactionMode?: "FK" | "IK";
   movementToggles?: MovementToggles;
+  viewMode?: ViewModeId;
   onInteractionModeChange?: () => void;
   onToggleLotteMode?: () => void;
   onReturnDefaultPose?: () => void;
@@ -630,7 +642,7 @@ const isRuntimeIKChainEnabled = (
 
 
 
-const CanvasGrid: React.FC<CanvasGridProps> = ({
+const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
   width, height,
   majorGridSize,
   minorGridSize,
@@ -642,6 +654,7 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
   ikEnabled = true,
   interactionMode = "FK",
   movementToggles = {},
+  viewMode = 'default',
   onInteractionModeChange,
   onToggleLotteMode,
   onReturnDefaultPose,
@@ -699,7 +712,7 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
   onSetSegmentInterpolation,
   segmentIkTweenMap = {},
   onPatchSegmentIkTween,
-}) => {
+}, ref) => {
   const {
     stretchEnabled = true,
     softReachEnabled = true,
@@ -734,6 +747,8 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
     poseDirection = 'front',
     weightShiftLateral = 0,
     weightShiftDepth = 0,
+    ikGravityArmHoldEnabled = false,
+    ikGravityLegHoldEnabled = false,
   } = movementToggles;
   const resolvedBackgroundLayer = backgroundImageLayer ?? DEFAULT_IMAGE_LAYER;
   const resolvedForegroundLayer = foregroundImageLayer ?? DEFAULT_IMAGE_LAYER;
@@ -2050,6 +2065,19 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
         resolvedTargets[solveChainId] = { x: solved.target.x, y: solved.target.y };
       }
 
+      // Apply gravity hold if enabled
+      if (ikGravityArmHoldEnabled || ikGravityLegHoldEnabled) {
+        const gravityHoldToggles: IkGravityHoldToggles = {
+          ikGravityArmHoldEnabled,
+          ikGravityLegHoldEnabled,
+        };
+        workingRotations = applyIkGravityHold({
+          currentRotations: rotationsRef.current,
+          solvedRotations: workingRotations,
+          toggles: gravityHoldToggles,
+        });
+      }
+
       Object.entries(legIntent.rotationOffsets).forEach(([jointId, offset]) => {
         if (typeof offset !== 'number' || !Number.isFinite(offset)) return;
         const prev = workingRotations[jointId] ?? 0;
@@ -2116,7 +2144,7 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
   };
 
   const ikDebugOverlayEnabled = React.useMemo(() => {
-    if (!import.meta.env.DEV || typeof window === 'undefined') {
+    if (!(import.meta as any).env.DEV || typeof window === 'undefined') {
       return false;
     }
     return (window as Window & { __IK_DEBUG_OVERLAY__?: boolean }).__IK_DEBUG_OVERLAY__ === true;
@@ -2461,6 +2489,26 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
     const sourcePose = bitruviusData.POSES?.["T-Pose"] ?? bitruviusData.POSES?.["Neutral"] ?? currentRotations;
     return computeThumbPosePath(sourcePose);
   }, [bitruviusData.POSES, currentRotations, computeThumbPosePath]);
+
+  useImperativeHandle(ref, () => ({
+    exportAsImage: async (options = {}) => {
+      const canvas = canvasRef.current;
+      if (!canvas) throw new Error('Canvas not available');
+      await exportCanvasAsImage(canvas, { format: 'png', ...options });
+    },
+    exportAsVideo: async (options = {}) => {
+      const canvas = canvasRef.current;
+      if (!canvas) throw new Error('Canvas not available');
+      await exportCanvasAsVideo(canvas, () => {
+        // Force a render frame
+        const renderFrame = () => {
+          // This will trigger the existing render loop
+        };
+        renderFrame();
+      }, { format: 'webm', ...options });
+    },
+    getCanvas: () => canvasRef.current,
+  }), [canvasRef]);
 
   return (
     <div className="relative overflow-hidden" style={{ width: `${width}px`, height: `${height}px` }}>
@@ -4704,6 +4752,7 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
                   {refinePanelMode === 'advanced' ? (
                     <>
                       {ikProfile === 'human' ? (
+                        <>
                         <div className="px-1 pb-2 mb-2 border-b border-white/10">
                           <div className="text-[10px] tracking-[0.08em] uppercase text-zinc-200 mb-1">Body Reactions</div>
                           {[
@@ -4735,6 +4784,36 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
                             );
                           })}
                         </div>
+                        <div className="px-1 pb-2 mb-2 border-b border-white/10">
+                          <div className="text-[10px] tracking-[0.08em] uppercase text-zinc-200 mb-1">Gravity Hold</div>
+                          {[
+                            { key: 'ikGravityArmHoldEnabled' as const, label: 'Arm Hold' },
+                            { key: 'ikGravityLegHoldEnabled' as const, label: 'Leg Hold' },
+                          ].map(({ key, label }) => {
+                            const enabled = (movementToggles || {})[key] !== false;
+                            return (
+                              <button
+                                key={key}
+                                type="button"
+                                onClick={() =>
+                                  onMovementTogglesChange({
+                                    ...(movementToggles || {}),
+                                    [key]: !enabled,
+                                  })
+                                }
+                                className={`w-full min-h-8 text-left px-2.5 py-2 text-[10px] tracking-[0.06em] uppercase border-b border-white/10 last:border-b-0 transition-colors ${
+                                  enabled ? 'text-violet-100 hover:bg-white/10' : 'text-zinc-500 hover:bg-white/5'
+                                }`}
+                              >
+                                <span className="flex items-center justify-between">
+                                  <span>{label}</span>
+                                  <span className="text-[10px]">{enabled ? 'ON' : 'OFF'}</span>
+                                </span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                        </>
                       ) : null}
                       <button
                         type="button"
@@ -4988,6 +5067,8 @@ const CanvasGrid: React.FC<CanvasGridProps> = ({
       `}</style>
     </div>
   );
-};
+});
+
+CanvasGrid.displayName = 'CanvasGrid';
 
 export default CanvasGrid;
