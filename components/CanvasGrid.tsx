@@ -784,6 +784,7 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
   const [showRefineMenu, setShowRefineMenu] = useState(false);
   const [showAnimationTimeline, setShowAnimationTimeline] = useState(true);
   const [bodyMasksEnabled, setBodyMasksEnabled] = useState(true);
+  const [hideBoneShapesWithMasks, setHideBoneShapesWithMasks] = useState(false);
   const [timelinePanelMode, setTimelinePanelMode] = useState<'basic' | 'advanced'>('basic');
   const [timelineMinimized, setTimelineMinimized] = useState(false);
   const [timelineControlsMinimized, setTimelineControlsMinimized] = useState(false);
@@ -801,7 +802,73 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
   const [showIkAdvancedControls, setShowIkAdvancedControls] = useState(false);
   const [fkBendOffsetByJoint, setFkBendOffsetByJoint] = useState<Record<string, number>>({});
   const [fkStretchOffsetByJoint, setFkStretchOffsetByJoint] = useState<Record<string, number>>({});
+  const [jointTinkerLengths, setJointTinkerLengths] = useState<Record<string, number>>({});
   const [ikPosePrograms, setIkPosePrograms] = useState<IkPoseProgramMap>(DEFAULT_IK_POSE_PROGRAMS);
+
+  // Move computeWorld to top to resolve initialization order and prevent ReferenceError
+  const computeWorld = useCallback((jointId: string, rotations: SkeletonRotations, canvasCenter: [number, number]): WorldCoords => {
+    // If joint tinker mode is active, use modified bone lengths
+    if (showIkAdvancedControls && Object.keys(jointTinkerLengths).length > 0) {
+      const path: string[] = [];
+      let currentJointId: string | null = jointId;
+      while (currentJointId) {
+        path.unshift(currentJointId);
+        currentJointId = bitruviusData.JOINT_DEFS[currentJointId]?.parent ?? null;
+      }
+
+      const rootX_local = rootX;
+      const rootY_local = rootY;
+      const rootRotate_local = rootRotate;
+      let worldX = canvasCenter[0] + rootX_local;
+      let worldY = canvasCenter[1] + rootY_local;
+      let worldAngle = (rotations.root || 0) + rootRotate_local;
+      let parentAngle = 0;
+
+      for (const pathJointId of path) {
+        if (pathJointId === 'root') {
+          parentAngle = worldAngle;
+          continue;
+        }
+
+        const jointDef = bitruviusData.JOINT_DEFS[pathJointId];
+        if (!jointDef) {
+          continue;
+        }
+
+        // Use dynamic bone length if available in joint tinker mode, otherwise use original
+        const [pivotX, pivotY] = jointDef.pivot;
+        const originalLength = Math.hypot(pivotX, pivotY);
+        const tinkerLength = jointTinkerLengths[pathJointId];
+        const effectiveLength = (tinkerLength !== undefined && tinkerLength > 0) ? tinkerLength : originalLength;
+        
+        // Scale the pivot vector to match the effective length
+        const scale = effectiveLength / originalLength;
+        const scaledPivotX = pivotX * scale;
+        const scaledPivotY = pivotY * scale;
+        
+        const cosA = Math.cos(worldAngle * Math.PI / 180);
+        const sinA = Math.sin(worldAngle * Math.PI / 180);
+        worldX += scaledPivotX * cosA - scaledPivotY * sinA;
+        worldY += scaledPivotX * sinA + scaledPivotY * cosA;
+        parentAngle = worldAngle;
+        worldAngle += (rotations[pathJointId] || 0);
+      }
+
+      return {
+        x: isNaN(worldX) ? 0 : worldX,
+        y: isNaN(worldY) ? 0 : worldY,
+        angle: isNaN(worldAngle) ? 0 : (worldAngle % 360),
+        parentAngle: isNaN(parentAngle) ? 0 : (parentAngle % 360),
+      };
+    }
+    
+    // Standard computeWorld for non-joint-tinker mode
+    return computeJointWorldForPose(jointId, bitruviusData.JOINT_DEFS, rotations, canvasCenter, {
+      x: rootX,
+      y: rootY,
+      rotate: rootRotate,
+    });
+  }, [bitruviusData.JOINT_DEFS, rootX, rootY, rootRotate, showIkAdvancedControls, jointTinkerLengths]);
 
   useEffect(() => {
     if (typeof window === 'undefined') {
@@ -828,6 +895,40 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
       // Ignore storage failures (private mode/quota).
     }
   }, [ikPosePrograms]);
+
+  // Clear joint tinker lengths when mode is disabled
+  useEffect(() => {
+    if (!showIkAdvancedControls && Object.keys(jointTinkerLengths).length > 0) {
+      setJointTinkerLengths({});
+    }
+  }, [showIkAdvancedControls, jointTinkerLengths]);
+
+  // Initialize all joint tinker lengths when mode is enabled
+  useEffect(() => {
+    if (showIkAdvancedControls && Object.keys(jointTinkerLengths).length === 0) {
+      const initialLengths: Record<string, number> = {};
+      Object.keys(bitruviusData.JOINT_DEFS).forEach((jointId) => {
+        if (jointId !== 'root') {
+          const jointDef = bitruviusData.JOINT_DEFS[jointId];
+          if (jointDef) {
+            const originalLength = Math.hypot(jointDef.pivot[0], jointDef.pivot[1]);
+            initialLengths[jointId] = originalLength;
+          }
+        }
+      });
+      setJointTinkerLengths(initialLengths);
+    }
+  }, [showIkAdvancedControls, jointTinkerLengths, bitruviusData.JOINT_DEFS]);
+
+  // Recovery function to reset joint tinker state
+  const resetJointTinkerState = useCallback(() => {
+    setJointTinkerLengths({});
+    setShowIkAdvancedControls(false);
+    // Reset to default pose
+    if (onReturnDefaultPose) {
+      onReturnDefaultPose();
+    }
+  }, [setJointTinkerLengths, setShowIkAdvancedControls, onReturnDefaultPose]);
 
   const isIkPoseProgramActive = useCallback((program: IkPoseProgram): boolean => {
     return (
@@ -909,6 +1010,18 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
     setActiveMaskUploadJointId(null);
   }, [activeMaskUploadJointId, onUploadBodyPartMaskLayer]);
 
+  const prevBitruviusDataRef = useRef(bitruviusData);
+  useEffect(() => {
+    if (prevBitruviusDataRef.current === bitruviusData) return;
+    prevBitruviusDataRef.current = bitruviusData;
+    setActiveIKChains(() => {
+      const next: { [chainId: string]: boolean } = {};
+      Object.keys(bitruviusData.IK_CHAINS).forEach((chainId) => {
+        next[chainId] = isRuntimeIKChainEnabled(bitruviusData.IK_CHAINS[chainId], bitruviusData);
+      });
+      return next;
+    });
+  }, [bitruviusData]);
   const maskableBodyPartIds = React.useMemo(() => {
     return bitruviusData.RENDER_ORDER.filter((jointId) => {
       const shape = bitruviusData.SHAPES[jointId];
@@ -1308,6 +1421,13 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
         cancelAnimationFrame(timelineConsoleScrollRafRef.current);
         timelineConsoleScrollRafRef.current = null;
       }
+      // Cleanup delayed clearing timeouts
+      if (ikClearTimeoutRef.current) {
+        clearTimeout(ikClearTimeoutRef.current);
+      }
+      if (fkClearTimeoutRef.current) {
+        clearTimeout(fkClearTimeoutRef.current);
+      }
     };
   }, []);
 
@@ -1317,12 +1437,7 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
     }
   }, [timelineScrollIndex, clampedTimelineScrollIndex]);
 
-  useEffect(() => {
-    if (refinePanelMode !== 'advanced' && showIkAdvancedControls) {
-      setShowIkAdvancedControls(false);
-    }
-  }, [refinePanelMode, showIkAdvancedControls]);
-
+  
   useEffect(() => {
     setTimelineStepFrames((prev) => clamp(Math.round(prev) || 1, 1, maxTimelineStepFrames));
   }, [maxTimelineStepFrames]);
@@ -1340,20 +1455,64 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
     }
   }, [bodyMasksEnabled, activeMaskEditorJointId]);
 
-  const computeWorld = useCallback((jointId: string, rotations: SkeletonRotations, canvasCenter: [number, number]): WorldCoords => {
-    return computeJointWorldForPose(jointId, bitruviusData.JOINT_DEFS, rotations, canvasCenter, {
-      x: rootX,
-      y: rootY,
-      rotate: rootRotate,
-    });
-  }, [bitruviusData.JOINT_DEFS, rootX, rootY, rootRotate]);
+
+  // Safeguard: Check if skeleton is too distorted and auto-recover
+  const checkSkeletonIntegrity = useCallback(() => {
+    if (!showIkAdvancedControls) return;
+    
+    // Check a few key joints to ensure they're in reasonable positions
+    const keyJoints = ['head', 'l_palm', 'r_palm', 'l_heel', 'r_heel'];
+    const center = [0, 0] as [number, number];
+    
+    let totalDistance = 0;
+    let jointCount = 0;
+    
+    for (const jointId of keyJoints) {
+      const world = computeWorld(jointId, rotationsRef.current, center);
+      const distance = Math.hypot(world.x - center[0], world.y - center[1]);
+      totalDistance += distance;
+      jointCount++;
+    }
+    
+    const averageDistance = totalDistance / jointCount;
+    
+    // If joints are too far from center (indicating radial breakup), auto-recover
+    if (averageDistance > 500) {
+      console.warn('Skeleton integrity compromised - auto-recovering joint tinker');
+      resetJointTinkerState();
+    }
+  }, [showIkAdvancedControls, rotationsRef, computeWorld, resetJointTinkerState]);
+
+  // Check skeleton integrity periodically when joint tinker is active
+  useEffect(() => {
+    if (!showIkAdvancedControls) return;
+    
+    const interval = setInterval(() => {
+      checkSkeletonIntegrity();
+      
+      // Log status for debugging
+      const activeJoints = Object.keys(jointTinkerLengths).length;
+      console.log(`Joint Tinker Active: ${activeJoints} joints modified`);
+      
+      // Emergency reset if too many joints are modified (potential corruption)
+      if (activeJoints > 15) {
+        console.warn('Too many joints modified - emergency reset');
+        resetJointTinkerState();
+      }
+    }, 2000); // Check every 2 seconds
+    return () => clearInterval(interval);
+  }, [showIkAdvancedControls, checkSkeletonIntegrity, jointTinkerLengths, resetJointTinkerState]);
 
   const computeThumbPosePath = useCallback((pose: SkeletonRotations): { path: string; joints: Array<{ x: number; y: number }> } => {
     const center: [number, number] = [0, 0];
     const worldPoints = new Map<string, { x: number; y: number }>();
     bitruviusData.HIERARCHY.forEach(([jointId]) => {
       const world = computeWorld(jointId, pose, center);
-      worldPoints.set(jointId, { x: world.x, y: world.y });
+      // NaN guards to prevent coordinate corruption in thumbnails
+      worldPoints.set(jointId, { 
+        x: isNaN(world.x) ? 0 : world.x, 
+        y: isNaN(world.y) ? 0 : world.y 
+      });
     });
 
     const allPoints = Array.from(worldPoints.values());
@@ -1389,7 +1548,12 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
 
     const thumbPoints = new Map<string, { x: number; y: number }>();
     worldPoints.forEach((point, key) => {
-      thumbPoints.set(key, toThumbPoint(point));
+      const thumbPoint = toThumbPoint(point);
+      // Additional NaN guard for thumbnail coordinates
+      thumbPoints.set(key, { 
+        x: isNaN(thumbPoint.x) ? 50 : thumbPoint.x, 
+        y: isNaN(thumbPoint.y) ? 50 : thumbPoint.y 
+      });
     });
 
     const segments: string[] = [];
@@ -1458,16 +1622,47 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
     lastValidRotationsRef.current = currentRotations;
   }, [currentRotations]);
 
+  // Add refs for delayed clearing to prevent snapback
+  const ikClearTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const fkClearTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
   useEffect(() => {
     if (!isPlaying && (!dragState || dragState.type !== "IK")) {
-      ikSmoothedTargetRef.current = {};
-      ikLastEventTsRef.current = {};
-      ikGroundPinsRef.current = {};
+      // Delay clearing IK targets to prevent snapback
+      if (ikClearTimeoutRef.current) {
+        clearTimeout(ikClearTimeoutRef.current);
+      }
+      ikClearTimeoutRef.current = setTimeout(() => {
+        ikSmoothedTargetRef.current = {};
+        ikLastEventTsRef.current = {};
+        ikGroundPinsRef.current = {};
+        ikClearTimeoutRef.current = null;
+      }, 200); // 200ms delay to prevent snapback
+    } else {
+      // Clear timeout immediately if IK interaction starts again
+      if (ikClearTimeoutRef.current) {
+        clearTimeout(ikClearTimeoutRef.current);
+        ikClearTimeoutRef.current = null;
+      }
     }
+    
     if (!isPlaying && (!dragState || dragState.type !== "FK")) {
-      fkSliderLastInputRef.current = {};
-      fkTargetRotationRef.current = {};
-      fkLastEventTsRef.current = {};
+      // Delay clearing FK targets to prevent snapback
+      if (fkClearTimeoutRef.current) {
+        clearTimeout(fkClearTimeoutRef.current);
+      }
+      fkClearTimeoutRef.current = setTimeout(() => {
+        fkSliderLastInputRef.current = {};
+        fkTargetRotationRef.current = {};
+        fkLastEventTsRef.current = {};
+        fkClearTimeoutRef.current = null;
+      }, 200); // 200ms delay to prevent snapback
+    } else {
+      // Clear timeout immediately if FK interaction starts again
+      if (fkClearTimeoutRef.current) {
+        clearTimeout(fkClearTimeoutRef.current);
+        fkClearTimeoutRef.current = null;
+      }
     }
   }, [dragState, isPlaying]);
 
@@ -1682,6 +1877,7 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
         : (rotationsRef.current[controllerId] ?? 0);
       fkTargetRotationRef.current[controllerId] = initialLocal;
       fkLastEventTsRef.current[controllerId] = performance.now();
+      
       setDragState({ id: controllerId, type: 'FK' });
     };
     const projectPointToSegment = (
@@ -1834,6 +2030,94 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
       if (id === 'root' && !rootRotateControlEnabled) {
         return;
       }
+      
+      // Joint Tinker Mode: Drag joint positions directly, extending/compacting bones
+      if (showIkAdvancedControls && id !== 'root') {
+        // Convert screen coordinates to world coordinates
+        const targetWorld = fromDisplayPoint(mx, my);
+        
+        // Get parent joint world position
+        const parentId = bitruviusData.JOINT_DEFS[id]?.parent;
+        if (!parentId) return;
+        
+        const parentWorld = computeWorld(parentId, rotationsRef.current, center);
+        
+        // Calculate the desired position relative to parent (simpler approach)
+        const relativePosition = {
+          x: targetWorld.x - parentWorld.x,
+          y: targetWorld.y - parentWorld.y
+        };
+        
+        // Get original bone vector from joint definition
+        const jointDef = bitruviusData.JOINT_DEFS[id];
+        const originalPivot = { x: jointDef.pivot[0], y: jointDef.pivot[1] };
+        const originalLength = Math.hypot(originalPivot.x, originalPivot.y);
+        
+        // Calculate the new bone length
+        const newLength = Math.hypot(relativePosition.x, relativePosition.y);
+        
+        if (originalLength > 0 && newLength > 0 && isFinite(newLength)) {
+          // Apply constraints to prevent extreme changes
+          const minLength = originalLength * 0.5; // Minimum 50% of original length
+          const maxLength = originalLength * 2.0; // Maximum 200% of original length
+          const constrainedLength = Math.max(minLength, Math.min(newLength, maxLength));
+          
+          // Calculate the angle needed to point from parent to target position
+          const desiredAngle = r2d(Math.atan2(relativePosition.y, relativePosition.x));
+          const parentAngle = parentWorld.angle;
+          
+          // Calculate the local rotation that would achieve this position
+          let targetLocal = normA(desiredAngle - parentAngle);
+          
+          // Apply constraints if enabled
+          const lim = bitruviusData.JOINT_LIMITS[id];
+          if (fkConstraintsEnabled && lim) {
+            targetLocal = clamp(targetLocal, lim.min, lim.max);
+          }
+          
+          // Smooth the rotation
+          const previousLocal = rotationsRef.current[id] ?? 0;
+          const now = performance.now();
+          const previousEventTs = fkLastEventTsRef.current[id] ?? now;
+          const dtMs = Math.max(0, now - previousEventTs);
+          fkLastEventTsRef.current[id] = now;
+          
+          const fkRotationFluidity = clamp((fkRotationSensitivity + fkRotationResponse) / 2, 0.35, 1.6);
+          const fluidityAlpha = fkRotationFluidity >= 1
+            ? 1
+            : resolveTemporalAlpha(fkRotationFluidity, dtMs || IK_BASE_FRAME_MS);
+          const dtScale = clamp(dtMs || IK_BASE_FRAME_MS, IK_EVENT_DT_MIN_MS, IK_EVENT_DT_MAX_MS) / IK_BASE_FRAME_MS;
+          const maxStep = FK_ROTATION_STEP_MAX * Math.max(0.55, fkRotationFluidity) * dtScale;
+          
+          let local = previousLocal + clamp(
+            normA(targetLocal - previousLocal) * fluidityAlpha,
+            -maxStep,
+            maxStep
+          );
+          
+          if (fkConstraintsEnabled && lim) local = clamp(local, lim.min, lim.max);
+          
+          const localDelta = normA(local - previousLocal);
+          if (Math.abs(localDelta) <= FK_ROTATION_APPLY_EPSILON_DEG) {
+            return;
+          }
+          
+          // Update the dynamic bone length for this joint (simpler approach)
+          setJointTinkerLengths(prev => ({
+            ...prev,
+            [id]: constrainedLength
+          }));
+          
+          // Apply rotation to current joint only (maintain hierarchy)
+          const nextRots = { ...rotationsRef.current, [id]: local };
+          rotationsRef.current = nextRots;
+          lastValidRotationsRef.current = nextRots;
+          onRotationsChange?.(nextRots);
+        }
+        return;
+      }
+      
+      // Standard FK mode (existing logic)
       const world = computeWorld(id, rotationsRef.current, center);
       const worldDisplay = toDisplayPoint(world.x, world.y);
       const parentId = bitruviusData.JOINT_DEFS[id]?.parent;
@@ -2201,6 +2485,8 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
       runtimeGeometry,
       showIkDebugOverlay: ikDebugOverlayEnabled,
       headGridHover: hoveredHeadGrid,
+      defaultPieceConfigs,
+      hideBoneShapesWithMasks: hideBoneShapesWithMasks && bodyMasksEnabled,
     });
   }, [
     width,
@@ -2225,6 +2511,8 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
     runtimeGeometry,
     ikDebugOverlayEnabled,
     hoveredHeadGrid,
+    defaultPieceConfigs,
+    hideBoneShapesWithMasks,
   ]);
 
   const gridRefineTop = UI_INSET + (onExitGridView ? 38 : 0);
@@ -2248,7 +2536,7 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
     return layer?.src ? count + 1 : count;
   }, 0);
   const activeMaskEditorJointLabel = activeMaskEditorJointId
-    ? bitruviusData.JOINT_DEFS[activeMaskEditorJointId]?.label ?? activeMaskEditorJointId
+    ? bitruviusData.MASK_MENU_LABELS[activeMaskEditorJointId] ?? bitruviusData.JOINT_DEFS[activeMaskEditorJointId]?.label ?? activeMaskEditorJointId
     : '';
   const activeMaskEditorLayer: BodyPartMaskLayer = activeMaskEditorJointId
     ? {
@@ -2267,7 +2555,7 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
     )
   );
   const activeMaskRotation = Math.round(
-    clamp(Number.isFinite(activeMaskEditorLayer.rotationDeg) ? activeMaskEditorLayer.rotationDeg : 0, -180, 180)
+    clamp(Number.isFinite(activeMaskEditorLayer.rotationDeg) ? activeMaskEditorLayer.rotationDeg : 0, -360, 360)
   );
   const activeMaskSkewX = Math.round(
     clamp(Number.isFinite(activeMaskEditorLayer.skewXDeg) ? activeMaskEditorLayer.skewXDeg : 0, -80, 80)
@@ -2291,7 +2579,7 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
     onPatchBodyPartMaskLayer?.(activeMaskEditorJointId, patch);
   }, [activeMaskEditorJointId, onPatchBodyPartMaskLayer]);
   const activeDefaultPieceLabel = activeDefaultPieceId
-    ? bitruviusData.JOINT_DEFS[activeDefaultPieceId]?.label ?? activeDefaultPieceId
+    ? bitruviusData.MASK_MENU_LABELS[activeDefaultPieceId] ?? bitruviusData.JOINT_DEFS[activeDefaultPieceId]?.label ?? activeDefaultPieceId
     : '';
   const activeDefaultPieceConfig = activeDefaultPieceId ? defaultPieceConfigs?.[activeDefaultPieceId] : undefined;
   const activeDefaultPieceVisible = activeDefaultPieceConfig?.visible ?? true;
@@ -2387,7 +2675,7 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
         preferredAngle = Math.atan2(vy, vx);
       }
       preferredAngle = wrapAngle(preferredAngle);
-      const handleLabel = bitruviusData.JOINT_DEFS[jointId]?.label ?? jointId;
+      const handleLabel = bitruviusData.MASK_MENU_LABELS[jointId] ?? bitruviusData.JOINT_DEFS[jointId]?.label ?? jointId;
       const shortLabel = handleLabel.replace(/_/g, ' ').toUpperCase();
       return {
         jointId,
@@ -2657,6 +2945,14 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
                   title="Toggle basic and advanced timeline controls"
                 >
                   Mode: {timelinePanelMode === 'advanced' ? 'Advanced' : 'Basic'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowIkAdvancedControls((prev) => !prev)}
+                  className="min-h-7 px-2 py-1 text-[10px] border border-white/15 rounded text-zinc-100 hover:bg-white/10 transition-colors"
+                  title="Toggle joint tinkering controls"
+                >
+                  Joint Tinker: {showIkAdvancedControls ? 'On' : 'Off'}
                 </button>
                 <button
                   type="button"
@@ -3136,6 +3432,14 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
                         >
                           Masks {bodyMasksEnabled ? 'On' : 'Off'}
                         </button>
+                        <button
+                          type="button"
+                          onClick={() => setHideBoneShapesWithMasks((prev) => !prev)}
+                          disabled={!bodyMasksEnabled}
+                          className="min-h-8 px-2 py-1 text-[10px] border border-white/15 rounded text-zinc-200 hover:bg-white/10 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                          Hide Shapes {hideBoneShapesWithMasks ? 'On' : 'Off'}
+                        </button>
                       </div>
                     </div>
                     <div className="space-y-1.5 border border-white/10 rounded p-2">
@@ -3145,7 +3449,7 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
                       </div>
                       <div className="max-h-44 overflow-y-auto custom-scrollbar space-y-1">
                         {defaultPieceIds.map((jointId) => {
-                          const label = bitruviusData.JOINT_DEFS[jointId]?.label ?? jointId;
+                          const label = bitruviusData.MASK_MENU_LABELS[jointId] ?? bitruviusData.JOINT_DEFS[jointId]?.label ?? jointId;
                           const config = defaultPieceConfigs?.[jointId];
                           const visible = config?.visible ?? true;
                           return (
@@ -3348,8 +3652,8 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
                                 {thumb.joints.map((jointPoint, jointIndex) => (
                                   <circle
                                     key={`joint-${jointIndex}`}
-                                    cx={jointPoint.x}
-                                    cy={jointPoint.y}
+                                    cx={isNaN(jointPoint.x) ? 50 : jointPoint.x}
+                                    cy={isNaN(jointPoint.y) ? 50 : jointPoint.y}
                                     r="1.8"
                                     fill="rgba(216, 180, 254, 0.95)"
                                   />
@@ -3887,11 +4191,11 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
                   <span className="text-[9px] tracking-[0.05em] uppercase text-zinc-400">Rotate</span>
                   <input
                     type="number"
-                    min={-180}
-                    max={180}
+                    min={-360}
+                    max={360}
                     value={activeMaskRotation}
                     disabled={!onPatchBodyPartMaskLayer}
-	                    onChange={(event) => patchActiveMaskEditor({ rotationDeg: clamp(Number(event.target.value), -180, 180) })}
+	                    onChange={(event) => patchActiveMaskEditor({ rotationDeg: clamp(Number(event.target.value), -360, 360) })}
 	                    className="w-full min-h-8 bg-zinc-950/75 border border-zinc-800 rounded px-2 py-1 text-[10px] text-zinc-300 disabled:opacity-45 disabled:cursor-not-allowed"
 	                  />
 	                </label>
@@ -3997,28 +4301,39 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
               </button>
             ) : null}
 
-            {onMovementTogglesChange ? (
+            {interactionMode === "FK" && onMovementTogglesChange ? (
               <button
                 type="button"
-                onClick={() =>
-                  onMovementTogglesChange({
-                    ...(movementToggles || {}),
-                    fkConstraintsEnabled: (movementToggles?.fkConstraintsEnabled ?? false) ? false : true,
-                  })
-                }
+                onClick={() => setShowIkAdvancedControls((prev) => !prev)}
                 className="min-h-9 px-3 py-2 text-[11px] tracking-[0.1em] font-semibold uppercase rounded transition-colors"
                 style={{
-                  background: (movementToggles?.fkConstraintsEnabled ?? false)
+                  background: showIkAdvancedControls
                     ? 'rgba(16, 88, 56, 0.34)'
                     : 'rgba(88, 82, 108, 0.28)',
-                  border: (movementToggles?.fkConstraintsEnabled ?? false)
+                  border: showIkAdvancedControls
                     ? '1px solid rgba(74, 222, 128, 0.62)'
                     : '1px solid rgba(158, 150, 184, 0.62)',
                   color: 'rgba(232, 228, 243, 0.95)',
                 }}
-                title="Toggle FK joint angle constraints"
+                title="Toggle joint tinker mode for click and drag joint manipulation"
               >
-                Joint Limits {(movementToggles?.fkConstraintsEnabled ?? false) ? 'On' : 'Off'}
+                Joint Tinker {showIkAdvancedControls ? 'On' : 'Off'}
+              </button>
+            ) : null}
+
+            {showIkAdvancedControls && onReturnDefaultPose ? (
+              <button
+                type="button"
+                onClick={resetJointTinkerState}
+                className="min-h-9 px-3 py-2 text-[11px] tracking-[0.1em] font-semibold uppercase rounded transition-colors"
+                style={{
+                  background: 'rgba(220, 38, 38, 0.34)',
+                  border: '1px solid rgba(248, 113, 113, 0.62)',
+                  color: 'rgba(254, 226, 226, 0.95)',
+                }}
+                title="Reset joint tinker and restore default pose"
+              >
+                Reset Tinker
               </button>
             ) : null}
 
@@ -4146,8 +4461,8 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
                 {defaultPoseThumb.joints.map((jointPoint, jointIndex) => (
                   <circle
                     key={`default-joint-${jointIndex}`}
-                    cx={jointPoint.x}
-                    cy={jointPoint.y}
+                    cx={isNaN(jointPoint.x) ? 50 : jointPoint.x}
+                    cy={isNaN(jointPoint.y) ? 50 : jointPoint.y}
                     r="1.7"
                     fill="rgba(196, 181, 253, 0.95)"
                   />
@@ -4419,7 +4734,7 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
                       Rot To Ground {rootGroundLockEnabled ? 'On' : 'Off'}
                     </button>
                   </div>
-                  {refinePanelMode === 'advanced' ? (
+                  {(refinePanelMode === 'advanced' || true) ? (
                     <div className="max-h-72 overflow-y-auto custom-scrollbar pr-1 space-y-1">
                       {bitruviusData.HIERARCHY.map(([jointId]) => {
                         const label = bitruviusData.JOINT_DEFS[jointId]?.label ?? jointId;
@@ -4485,7 +4800,7 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
                     </div>
                   ) : (
                     <div className="px-1 py-1.5 text-[10px] text-zinc-400 tracking-[0.04em]">
-                      Advanced mode unlocks per-joint rotation sliders.
+                      Per-joint rotation sliders available for fine control.
                     </div>
                   )}
                 </div>
@@ -4749,7 +5064,7 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
                       </button>
                     </div>
                   </div>
-                  {refinePanelMode === 'advanced' ? (
+                  {(refinePanelMode === 'advanced' || true) ? (
                     <>
                       {ikProfile === 'human' ? (
                         <>
@@ -4815,13 +5130,6 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
                         </div>
                         </>
                       ) : null}
-                      <button
-                        type="button"
-                        onClick={() => setShowIkAdvancedControls((prev) => !prev)}
-                        className="w-full min-h-8 text-left px-2.5 py-2 text-[10px] tracking-[0.06em] uppercase border border-white/10 rounded text-zinc-300 hover:bg-white/10 transition-colors"
-                      >
-                        Expert IK Controls {showIkAdvancedControls ? 'On' : 'Off'}
-                      </button>
                       {showIkAdvancedControls ? (
                         <div className="mt-2 border border-white/10 rounded">
                           {[

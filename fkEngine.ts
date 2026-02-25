@@ -94,6 +94,20 @@ export const computeJointWorldForPose = (
     worldAngle += d2r(rotations[pathJointId] || 0);
   }
 
+  // NaN guards to prevent coordinate skew
+  if (!Number.isFinite(worldX) || isNaN(worldX)) {
+    worldX = canvasCenter[0] + (rootTransform?.x ?? 0);
+  }
+  if (!Number.isFinite(worldY) || isNaN(worldY)) {
+    worldY = canvasCenter[1] + (rootTransform?.y ?? 0);
+  }
+  if (!Number.isFinite(worldAngle) || isNaN(worldAngle)) {
+    worldAngle = d2r(rotations.root || 0) + d2r(rootTransform?.rotate ?? 0);
+  }
+  if (!Number.isFinite(parentAngle) || isNaN(parentAngle)) {
+    parentAngle = d2r(rotations.root || 0) + d2r(rootTransform?.rotate ?? 0);
+  }
+
   return {
     x: worldX,
     y: worldY,

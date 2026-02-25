@@ -84,6 +84,7 @@ interface RenderOptions {
   showIkDebugOverlay?: boolean;
   headGridHover?: { label: string; x: number; y: number; occludedByModel: boolean } | null;
   defaultPieceConfigs?: Record<string, DefaultPieceConfig>;
+  hideBoneShapesWithMasks?: boolean;
 }
 
 const layerImageCache: Record<string, HTMLImageElement> = {};
@@ -139,6 +140,8 @@ export const render = (options: RenderOptions) => {
     runtimeGeometry,
     showIkDebugOverlay = false,
     headGridHover = null,
+    defaultPieceConfigs,
+    hideBoneShapesWithMasks = false,
   } = options;
   const activeVisualModules: VisualModuleState = {
     ...DEFAULT_VISUAL_MODULE_STATE,
@@ -460,6 +463,14 @@ export const render = (options: RenderOptions) => {
         if (!pieceVisible) {
           return;
         }
+        
+        // Check if we should hide this bone shape when masks are active (for ghost frames)
+        const hasActiveMask = bodyPartMasks?.[id]?.visible && bodyPartMasks?.[id]?.src;
+        if (hideBoneShapesWithMasks && hasActiveMask && !isShadow) {
+          // Skip drawing bone shape for ghost frames when masks are active
+          return;
+        }
+        
         const t = computeWorld(id, rots, center);
         ctx.save();
         if (isShadow && drawShadows) {
@@ -574,9 +585,8 @@ export const render = (options: RenderOptions) => {
     if (!pos) {
       return;
     }
-    const parentId = bitruviusData.JOINT_DEFS[jointId]?.parent;
-    const parentPos = parentId ? positions[parentId] : undefined;
-    const anchor = parentPos ?? pos;
+    // For masks to pivot exactly at the joint, use current joint position as anchor
+    const anchor = pos;
 
     const angleRad = d2r(worldAngleDeg);
     const cosA = Math.cos(angleRad);
@@ -670,6 +680,17 @@ export const render = (options: RenderOptions) => {
     bitruviusData.RENDER_ORDER.forEach(id => {
       const shape = bitruviusData.SHAPES[id];
       if (!shape || shape.type === "none") return;
+      
+      // Check if we should hide this bone shape when masks are active
+      const hasActiveMask = bodyPartMasks?.[id]?.visible && bodyPartMasks?.[id]?.src;
+      if (hideBoneShapesWithMasks && hasActiveMask && !isShadow) {
+        // Skip drawing the bone shape, but still draw the mask
+        const pos = positions[id];
+        const t = computeWorld(id, rotations, center);
+        drawBodyPartMask(id, shape, t.angle);
+        return;
+      }
+      
       const pos = positions[id];
       const t = computeWorld(id, rotations, center);
       ctx.save();

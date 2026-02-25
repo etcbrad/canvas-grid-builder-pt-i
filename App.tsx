@@ -13,20 +13,121 @@ import TimelineStrip from './components/TimelineStrip';
 import OnionSkinControls from './components/OnionSkinControls';
 
 // Temporary type aliases until pose-to-pose-engine is installed
-interface PoseKeyframe {
+interface PoseKeyframe<T = SkeletonRotations> {
   id: string;
   frame: number;
-  pose: SkeletonRotations;
+  pose: T;
 }
 
-interface AnimationClip<T> {
-  keyframes: PoseKeyframe[];
+class AnimationClip<T = SkeletonRotations> {
+  keyframes: PoseKeyframe<T>[];
   duration: number;
-  getKeyframes(): PoseKeyframe[];
-  sampleFrame: (frame: number) => SkeletonRotations;
-  upsertKeyframe: (frame: number, pose: SkeletonRotations) => void;
-  removeKeyframe: (frame: number) => void;
-  getGhostFrames: (options?: { past?: number; future?: number }) => Array<{ frame: number; pose: SkeletonRotations; opacity: number }>;
+  private interpolatePoseFn: (from: T, to: T, t: number) => T;
+  private transitions: Record<string, { durationFrames: number }>;
+  private frameCount: number;
+  private loop: boolean;
+
+  constructor(options: {
+    keyframes: PoseKeyframe<T>[];
+    frameCount: number;
+    loop: boolean;
+    interpolatePose: (from: T, to: T, t: number) => T;
+    transitions?: Record<string, { durationFrames: number }>;
+  }) {
+    this.keyframes = options.keyframes;
+    this.frameCount = options.frameCount;
+    this.duration = options.frameCount;
+    this.loop = options.loop;
+    this.interpolatePoseFn = options.interpolatePose;
+    this.transitions = options.transitions || {};
+  }
+
+  getKeyframes(): PoseKeyframe<T>[] {
+    return this.keyframes;
+  }
+
+  sampleFrame(frame: number): T {
+    if (this.keyframes.length === 0) {
+      return {} as T;
+    }
+
+    if (this.keyframes.length === 1) {
+      return this.keyframes[0].pose;
+    }
+
+    // Simple linear interpolation between keyframes
+    const sortedKeyframes = [...this.keyframes].sort((a, b) => a.frame - b.frame);
+    const clampedFrame = this.loop 
+      ? frame % this.frameCount 
+      : Math.max(0, Math.min(frame, this.frameCount - 1));
+
+    // Find surrounding keyframes
+    let fromKf = sortedKeyframes[0];
+    let toKf = sortedKeyframes[sortedKeyframes.length - 1];
+
+    for (let i = 0; i < sortedKeyframes.length - 1; i++) {
+      if (clampedFrame >= sortedKeyframes[i].frame && clampedFrame <= sortedKeyframes[i + 1].frame) {
+        fromKf = sortedKeyframes[i];
+        toKf = sortedKeyframes[i + 1];
+        break;
+      }
+    }
+
+    if (fromKf.frame === toKf.frame) {
+      return fromKf.pose;
+    }
+
+    const t = (clampedFrame - fromKf.frame) / (toKf.frame - fromKf.frame);
+    return this.interpolatePoseFn(fromKf.pose, toKf.pose, t);
+  }
+
+  upsertKeyframe(keyframe: PoseKeyframe<T>): void {
+    const existingIndex = this.keyframes.findIndex(kf => kf.id === keyframe.id);
+    if (existingIndex >= 0) {
+      this.keyframes[existingIndex] = keyframe;
+    } else {
+      this.keyframes.push(keyframe);
+    }
+  }
+
+  removeKeyframe(frameId: string): void {
+    this.keyframes = this.keyframes.filter(kf => kf.id !== frameId);
+  }
+
+  getGhostFrames(options: { frame: number; past?: number; future?: number }): Array<{ frame: number; pose: T; opacity: number; direction?: 'past' | 'future' }> {
+    const ghosts: Array<{ frame: number; pose: T; opacity: number; direction?: 'past' | 'future' }> = [];
+    const currentFrame = options.frame;
+    const pastCount = options.past || 3;
+    const futureCount = options.future || 3;
+
+    // Add past frames
+    for (let i = 1; i <= pastCount; i++) {
+      const frame = currentFrame - i;
+      if (frame >= 0) {
+        ghosts.push({
+          frame,
+          pose: this.sampleFrame(frame),
+          opacity: 0.3 * (1 - i / (pastCount + 1)),
+          direction: 'past'
+        });
+      }
+    }
+
+    // Add future frames
+    for (let i = 1; i <= futureCount; i++) {
+      const frame = currentFrame + i;
+      if (frame < this.frameCount) {
+        ghosts.push({
+          frame,
+          pose: this.sampleFrame(frame),
+          opacity: 0.3 * (1 - i / (futureCount + 1)),
+          direction: 'future'
+        });
+      }
+    }
+
+    return ghosts;
+  }
 }
 
 import { createInterpolator } from './adapters/poseInterpolator';
@@ -43,7 +144,13 @@ import {
   type SegmentIkTweenMap,
   type SegmentIkTweenSettings,
 } from './animationIkTween';
-import { exportCanvasAsImage, exportCanvasAsVideo, type ExportOptions, type VideoExportOptions } from './exportUtils';
+
+import { 
+  animationCaptureManager, 
+  type AnimationCapture, 
+  type AnimationCaptureData, 
+  type AnimationCaptureOptions 
+} from './animationCapture';
 
 const DEFAULT_ONION = { past: 2, future: 2, enabled: false };
 const VISUAL_MODULES_DEFAULT: VisualModuleState = {
@@ -397,6 +504,7 @@ const App: React.FC = () => {
   const [lotteMode, setLotteMode] = useState(false);
   const [masterPin, setMasterPin] = useState<[number, number]>([0, 0]);
   const [bodyRot, setBodyRot] = useState(0);
+  const [isManualPoseChange, setIsManualPoseChange] = useState(false);
   const [interactionMode, setInteractionMode] = useState<"FK" | "IK">("FK");
   const [isCalibrating, setIsCalibrating] = useState(false);
   const [movementToggles, setMovementToggles] = useState<MovementToggles>({
@@ -776,6 +884,9 @@ const App: React.FC = () => {
   }, [clearBodyPartMaskObjectUrl]);
 
   const [defaultPieceConfigs, setDefaultPieceConfigs] = useState<Record<string, DefaultPieceConfig>>({});
+  const [captures, setCaptures] = useState<AnimationCapture[]>([]);
+  const [isCapturing, setIsCapturing] = useState(false);
+  const [captureName, setCaptureName] = useState('');
 
   const handlePatchDefaultPieceConfig = useCallback((jointId: string, patch: Partial<DefaultPieceConfig>) => {
     setDefaultPieceConfigs((prev) => {
@@ -820,6 +931,68 @@ const App: React.FC = () => {
       },
     }));
   }, []);
+
+  const handleMirrorBodyPartMask = useCallback((sourceJointId: string) => {
+    const targetJointId = modelData.MASK_MIRROR_MAPPINGS[sourceJointId];
+    if (!targetJointId) return;
+
+    const sourceLayer = bodyPartMaskLayers[sourceJointId];
+    if (!sourceLayer?.src) return;
+
+    // Create a mirrored copy of the source mask
+    const mirroredLayer: BodyPartMaskLayer = {
+      ...DEFAULT_BODY_PART_MASK_LAYER,
+      ...sourceLayer,
+      // Mirror the rotation (invert horizontal rotation)
+      rotationDeg: sourceLayer.rotationDeg ? -sourceLayer.rotationDeg : 0,
+      // Mirror the X offset
+      offsetX: sourceLayer.offsetX ? -sourceLayer.offsetX : 0,
+      // Keep Y offset the same
+      offsetY: sourceLayer.offsetY,
+      // Keep other properties the same
+      scale: sourceLayer.scale,
+      opacity: sourceLayer.opacity,
+      skewXDeg: sourceLayer.skewXDeg ? -sourceLayer.skewXDeg : 0,
+      skewYDeg: sourceLayer.skewYDeg,
+      blendMode: sourceLayer.blendMode,
+      filter: sourceLayer.filter,
+      mode: sourceLayer.mode,
+      visible: true,
+    };
+
+    // Handle image source with blob URL management
+    if (sourceLayer.src) {
+      clearBodyPartMaskObjectUrl(targetJointId);
+      // For mirroring, we need to create a new blob URL from the same source
+      // This assumes the source is a blob URL or can be converted
+      fetch(sourceLayer.src)
+        .then(response => response.blob())
+        .then(blob => {
+          const newUrl = URL.createObjectURL(blob);
+          bodyPartMaskObjectUrlRef.current[targetJointId] = newUrl;
+          setBodyPartMaskLayers((prev) => ({
+            ...prev,
+            [targetJointId]: {
+              ...mirroredLayer,
+              src: newUrl,
+            },
+          }));
+        })
+        .catch(error => {
+          console.error('Failed to mirror mask:', error);
+          // Fallback: use the same src URL
+          setBodyPartMaskLayers((prev) => ({
+            ...prev,
+            [targetJointId]: mirroredLayer,
+          }));
+        });
+    } else {
+      setBodyPartMaskLayers((prev) => ({
+        ...prev,
+        [targetJointId]: mirroredLayer,
+      }));
+    }
+  }, [bodyPartMaskLayers, clearBodyPartMaskObjectUrl]);
 
   const ensureFrameCapacity = useCallback((frame: number): number => {
     const safeFrame = Math.max(0, Math.round(frame));
@@ -1118,32 +1291,85 @@ const App: React.FC = () => {
       setModuleStatusLine('Interaction Engine is off. Reset is disabled.');
       return;
     }
+    console.log('🔄 Pose reset triggered - this may cause snapback');
     clearRotationGestureCheckpoint();
     pushUndoSnapshot();
-    setRotations(modelData.POSES["T-Pose"]);
-    setMasterPin([0, 0]);
-    setBodyRot(0);
-    if (coreModules.animation_engine) {
-      upsertPoseKeyframe(currentFrame, modelData.POSES["T-Pose"]);
-      setKeyframesVersion((v) => v + 1);
-    }
+    
+    // Smooth transition to T-Pose instead of immediate snap
+    const targetPose = modelData.POSES["T-Pose"];
+    const startPose = { ...rotations };
+    const startTime = performance.now();
+    const duration = 300; // 300ms smooth transition
+    
+    const animateToReset = (currentTime: number) => {
+      const elapsed = currentTime - startTime;
+      const progress = Math.min(elapsed / duration, 1);
+      const eased = 1 - Math.pow(1 - progress, 3); // Ease out cubic
+      
+      const interpolatedPose: SkeletonRotations = {};
+      Object.keys(startPose).forEach(jointId => {
+        const startValue = startPose[jointId] ?? 0;
+        const targetValue = targetPose[jointId] ?? 0;
+        interpolatedPose[jointId] = startValue + (targetValue - startValue) * eased;
+      });
+      
+      setRotations(interpolatedPose);
+      setMasterPin([0, 0]);
+      setBodyRot(0);
+      
+      if (progress < 1) {
+        requestAnimationFrame(animateToReset);
+      } else {
+        // Final update to ensure exact T-Pose
+        setRotations(targetPose);
+        setMasterPin([0, 0]);
+        setBodyRot(0);
+        if (coreModules.animation_engine) {
+          upsertPoseKeyframe(currentFrame, targetPose);
+          setKeyframesVersion((v) => v + 1);
+        }
+      }
+    };
+    
+    requestAnimationFrame(animateToReset);
   }, [
     clearRotationGestureCheckpoint,
     coreModules.animation_engine,
     coreModules.interaction_engine,
     currentFrame,
     pushUndoSnapshot,
+    rotations,
     upsertPoseKeyframe,
   ]);
 
+  const syncTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
   const syncRotationsFromClip = useCallback(() => {
-    const clip = clipRef.current;
-    try {
-      setRotations(clip.sampleFrame(currentFrame));
-    } catch {
-      // No keyframes - keep current
+    // Don't overwrite manual pose changes
+    if (isManualPoseChange) {
+      console.log('🚫 Sync blocked due to manual pose change');
+      return;
     }
-  }, [currentFrame]);
+    
+    // Clear existing timeout
+    if (syncTimeoutRef.current) {
+      clearTimeout(syncTimeoutRef.current);
+    }
+    
+    // Debounce sync to reduce jitter
+    syncTimeoutRef.current = setTimeout(() => {
+      const clip = clipRef.current;
+      try {
+        const sampledPose = clip.sampleFrame(currentFrame);
+        console.log('🔄 Syncing pose from clip at frame', currentFrame);
+        setRotations(sampledPose);
+      } catch {
+        // No keyframes - keep current
+        console.log('⚠️ No keyframes found at frame', currentFrame);
+      }
+      syncTimeoutRef.current = null;
+    }, 16); // Debounce to ~60fps
+  }, [currentFrame, isManualPoseChange]);
 
   useEffect(() => {
     if (isPlayingRef.current) {
@@ -1730,7 +1956,7 @@ const App: React.FC = () => {
 
   const ghostFrames = useMemo(() => {
     if (!coreModules.onion_skin || !onionSkinConfig.enabled) return undefined;
-    const ghosts = clipRef.current.getGhostFrames({ frame: currentFrame }, onionSkinConfig);
+    const ghosts = clipRef.current.getGhostFrames({ frame: currentFrame, past: onionSkinConfig.past, future: onionSkinConfig.future });
     return ghosts.map(g => ({
       rotations: g.pose,
       opacity: g.opacity,

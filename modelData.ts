@@ -106,6 +106,50 @@ export const CHAIN_LABELS: { [key: string]: string } = {
   spine:"Full Spine (IK)", core:"Core (IK)"
 };
 
+// Descriptive labels for mask menu - more human-friendly names
+export const MASK_MENU_LABELS: { [key: string]: string } = {
+  root: "Root Base",
+  pelvis: "Pelvis/Hips",
+  torso_base: "Lower Torso",
+  xiphoid: "Upper Spine",
+  spine_b: "Mid Spine", 
+  collar: "Collar/Shoulders",
+  neck: "Neck",
+  nose: "Nose Tip",
+  head: "Head/Skull",
+  l_shoulder: "Left Shoulder",
+  l_elbow: "Left Elbow",
+  l_palm: "Left Hand",
+  r_shoulder: "Right Shoulder", 
+  r_elbow: "Right Elbow",
+  r_palm: "Right Hand",
+  l_hip: "Left Hip",
+  l_knee: "Left Knee",
+  l_heel: "Left Foot",
+  r_hip: "Right Hip",
+  r_knee: "Right Knee", 
+  r_heel: "Right Foot",
+};
+
+// Mask mirroring mappings for arm and leg parts
+export const MASK_MIRROR_MAPPINGS: { [key: string]: string } = {
+  // Arm mirroring (left <-> right)
+  'l_shoulder': 'r_shoulder',
+  'l_elbow': 'r_elbow', 
+  'l_palm': 'r_palm',
+  'r_shoulder': 'l_shoulder',
+  'r_elbow': 'l_elbow',
+  'r_palm': 'l_palm',
+  
+  // Leg mirroring (left <-> right)
+  'l_hip': 'r_hip',
+  'l_knee': 'r_knee',
+  'l_heel': 'r_heel',
+  'r_hip': 'l_hip',
+  'r_knee': 'l_knee',
+  'r_heel': 'l_heel',
+};
+
 export const JOINT_LIMITS: { [key: string]: JointLimits } = {
   root:      { min:-180, max:180, allow360: true },
   pelvis:    { min:-45,  max:45  },
@@ -175,6 +219,8 @@ export interface BitruviusData {
   JOINT_DEFS: { [id: string]: JointDefinition };
   IK_CHAINS: { [id: string]: IKChain };
   CHAIN_LABELS: { [id: string]: string };
+  MASK_MENU_LABELS: { [id: string]: string };
+  MASK_MIRROR_MAPPINGS: { [id: string]: string };
   PRIORITY_ORDER: string[];
   JOINT_LIMITS: { [id: string]: JointLimits };
   POSES: { [id: string]: Pose };
@@ -185,7 +231,7 @@ export interface BitruviusData {
 }
 
 export const bitruviusData: BitruviusData = {
-  JOINT_DEFS, IK_CHAINS, CHAIN_LABELS, PRIORITY_ORDER: Object.keys(IK_CHAINS),
+  JOINT_DEFS, IK_CHAINS, CHAIN_LABELS, MASK_MENU_LABELS, MASK_MIRROR_MAPPINGS, PRIORITY_ORDER: Object.keys(IK_CHAINS),
   JOINT_LIMITS, POSES, SHAPES: SHAPES_DEFS, RENDER_ORDER, HIERARCHY,
   initialRotations: POSES["T-Pose"]
 };
