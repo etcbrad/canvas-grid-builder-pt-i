@@ -5292,9 +5292,9 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
           <div
             className="absolute flex flex-wrap items-center gap-2 p-2 rounded-lg pointer-events-auto"
             style={{
-              top: `${gridRefineTop}px`,
+              top: `${UI_INSET}px`,
               left: `${UI_INSET}px`,
-              right: `${UI_INSET}px`,
+              maxWidth: '420px',
               zIndex: 72,
               background: CONSOLE_PANEL_BACKGROUND,
               backdropFilter: 'blur(8px)',
@@ -5455,6 +5455,25 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
                 {lotteMode ? 'LOTTE' : 'BITRUVIUS'}
               </button>
             ) : null}
+
+            <button
+              type="button"
+              onClick={() => onMovementTogglesChange?.({
+                ...movementToggles,
+                rings: !visualModules?.rings,
+                headGrid: !visualModules?.headGrid,
+                fingerGrid: !visualModules?.fingerGrid,
+              })}
+              className="min-h-9 px-3 py-2 text-[11px] tracking-[0.1em] font-semibold uppercase rounded transition-colors"
+              style={{
+                background: visualModules?.rings ? 'rgba(139, 92, 246, 0.34)' : 'rgba(88, 82, 108, 0.28)',
+                border: visualModules?.rings ? '1px solid rgba(167, 139, 250, 0.62)' : '1px solid rgba(158, 150, 184, 0.62)',
+                color: 'rgba(232, 228, 243, 0.95)',
+              }}
+              title="Toggle all helper grids/rings"
+            >
+              Helpers {visualModules?.rings ? 'Hide' : 'Show'}
+            </button>
 
             {onMovementTogglesChange ? (
               <button
