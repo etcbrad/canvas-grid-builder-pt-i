@@ -1401,73 +1401,6 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
     });
   }, []);
 
-  // Memoize joint controls to prevent performance issues when refine panel is open
-  const jointControls = React.useMemo(() => {
-    if (!showRefineMenu) return null;
-    
-    return bitruviusData.HIERARCHY.map(([jointId]) => {
-      const label = bitruviusData.JOINT_DEFS[jointId]?.label ?? jointId;
-      const min = -180;
-      const max = 180;
-      const value = normA(rotationsRef.current[jointId] ?? currentRotations[jointId] ?? 0);
-      const bendOffset = clamp(Math.round(fkBendOffsetByJoint[jointId] ?? 0), -12, 12);
-      const stretchOffset = clamp(Math.round(fkStretchOffsetByJoint[jointId] ?? 0), -12, 12);
-      return (
-        <label key={jointId} className="block px-1 py-1.5 border-b border-white/10 last:border-b-0">
-          <div className="text-[10px] tracking-[0.06em] uppercase text-zinc-300 mb-1 flex items-center justify-between">
-            <span>{label}</span>
-            <span className="flex items-center gap-1.5">
-              <label className="flex items-center gap-1">
-                <span className="text-[8px] text-emerald-300">B</span>
-                <input
-                  type="number"
-                  min={-12}
-                  max={12}
-                  step={1}
-                  value={bendOffset}
-                  onChange={(event) => {
-                    const next = clamp(Number(event.target.value), -12, 12);
-                    setFkBendOffsetByJoint((prev) => ({ ...prev, [jointId]: Math.round(next) }));
-                  }}
-                  className="w-10 h-5 px-1 text-[9px] bg-zinc-900 border border-white/10 rounded text-zinc-100"
-                  title="Bend offset (-12..12)"
-                />
-              </label>
-              <label className="flex items-center gap-1">
-                <span className="text-[8px] text-sky-300">S</span>
-                <input
-                  type="number"
-                  min={-12}
-                  max={12}
-                  step={1}
-                  value={stretchOffset}
-                  onChange={(event) => {
-                    const next = clamp(Number(event.target.value), -12, 12);
-                    setFkStretchOffsetByJoint((prev) => ({ ...prev, [jointId]: Math.round(next) }));
-                  }}
-                  className="w-10 h-5 px-1 text-[9px] bg-zinc-900 border border-white/10 rounded text-zinc-100"
-                  title="Stretch offset (-12..12)"
-                />
-              </label>
-              <span className="text-zinc-500">{Math.round(value)} deg</span>
-            </span>
-          </div>
-          <input
-            type="range"
-            min={min}
-            max={max}
-            step={1}
-            value={value}
-            onMouseDown={() => { fkSliderLastInputRef.current[jointId] = value; }}
-            onChange={(e) => setJointRotationFromWrappedSlider(jointId, Number(e.target.value))}
-            className="w-full accent-violet-400"
-            title={jointId}
-          />
-        </label>
-      );
-    });
-  }, [showRefineMenu, bitruviusData.HIERARCHY, bitruviusData.JOINT_DEFS, currentRotations, fkBendOffsetByJoint, fkStretchOffsetByJoint, setJointRotationFromWrappedSlider]);
-
   // Requirement: Guides back out to the border (0 margin for guides)
   const UI_INSET = 12;
   const TIMELINE_RAIL_WIDTH = 280;
@@ -1953,6 +1886,73 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
     fkSliderLastInputRef.current[jointId] = wrapped;
     setJointRotationFromSlider(jointId, wrapped);
   }, [currentRotations, setJointRotationFromSlider]);
+
+  // Memoize joint controls to prevent performance issues when refine panel is open
+  const jointControls = React.useMemo(() => {
+    if (!showRefineMenu) return null;
+    
+    return bitruviusData.HIERARCHY.map(([jointId]) => {
+      const label = bitruviusData.JOINT_DEFS[jointId]?.label ?? jointId;
+      const min = -180;
+      const max = 180;
+      const value = normA(rotationsRef.current[jointId] ?? currentRotations[jointId] ?? 0);
+      const bendOffset = clamp(Math.round(fkBendOffsetByJoint[jointId] ?? 0), -12, 12);
+      const stretchOffset = clamp(Math.round(fkStretchOffsetByJoint[jointId] ?? 0), -12, 12);
+      return (
+        <label key={jointId} className="block px-1 py-1.5 border-b border-white/10 last:border-b-0">
+          <div className="text-[10px] tracking-[0.06em] uppercase text-zinc-300 mb-1 flex items-center justify-between">
+            <span>{label}</span>
+            <span className="flex items-center gap-1.5">
+              <label className="flex items-center gap-1">
+                <span className="text-[8px] text-emerald-300">B</span>
+                <input
+                  type="number"
+                  min={-12}
+                  max={12}
+                  step={1}
+                  value={bendOffset}
+                  onChange={(event) => {
+                    const next = clamp(Number(event.target.value), -12, 12);
+                    setFkBendOffsetByJoint((prev) => ({ ...prev, [jointId]: Math.round(next) }));
+                  }}
+                  className="w-10 h-5 px-1 text-[9px] bg-zinc-900 border border-white/10 rounded text-zinc-100"
+                  title="Bend offset (-12..12)"
+                />
+              </label>
+              <label className="flex items-center gap-1">
+                <span className="text-[8px] text-sky-300">S</span>
+                <input
+                  type="number"
+                  min={-12}
+                  max={12}
+                  step={1}
+                  value={stretchOffset}
+                  onChange={(event) => {
+                    const next = clamp(Number(event.target.value), -12, 12);
+                    setFkStretchOffsetByJoint((prev) => ({ ...prev, [jointId]: Math.round(next) }));
+                  }}
+                  className="w-10 h-5 px-1 text-[9px] bg-zinc-900 border border-white/10 rounded text-zinc-100"
+                  title="Stretch offset (-12..12)"
+                />
+              </label>
+              <span className="text-zinc-500">{Math.round(value)} deg</span>
+            </span>
+          </div>
+          <input
+            type="range"
+            min={min}
+            max={max}
+            step={1}
+            value={value}
+            onMouseDown={() => { fkSliderLastInputRef.current[jointId] = value; }}
+            onChange={(e) => setJointRotationFromWrappedSlider(jointId, Number(e.target.value))}
+            className="w-full accent-violet-400"
+            title={jointId}
+          />
+        </label>
+      );
+    });
+  }, [showRefineMenu, bitruviusData.HIERARCHY, bitruviusData.JOINT_DEFS, currentRotations, fkBendOffsetByJoint, fkStretchOffsetByJoint, setJointRotationFromWrappedSlider]);
 
 
 
