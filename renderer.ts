@@ -88,6 +88,15 @@ interface RenderOptions {
 }
 
 const layerImageCache: Record<string, HTMLImageElement> = {};
+const renderCache = new Map<string, any>();
+let lastRenderHash = '';
+
+// Performance monitoring
+const performanceMetrics = {
+  renderCount: 0,
+  averageRenderTime: 0,
+  lastRenderTime: 0
+};
 
 const clamp01 = (value: number): number => {
   if (!Number.isFinite(value)) return 1;
@@ -116,7 +125,15 @@ const resolveLayerImage = (src: string): HTMLImageElement | null => {
   return null;
 };
 
+// Generate render hash for cache invalidation
+const generateRenderHash = (options: Partial<RenderOptions>): string => {
+  const { width, height, rotations, visualModules, silhouetteMode, lotteMode } = options;
+  return `${width}x${height}-${JSON.stringify(rotations)}-${JSON.stringify(visualModules)}-${silhouetteMode}-${lotteMode}`;
+};
+
 export const render = (options: RenderOptions) => {
+  const startTime = performance.now();
+  
   const {
     ctx,
     width,
@@ -143,6 +160,19 @@ export const render = (options: RenderOptions) => {
     defaultPieceConfigs,
     hideBoneShapesWithMasks = false,
   } = options;
+  
+  // Early exit if canvas context is invalid
+  if (!ctx || !width || !height) {
+    return;
+  }
+  
+  // Check cache for identical render
+  const renderHash = generateRenderHash(options);
+  if (renderHash === lastRenderHash && !gridOnlyMode) {
+    return; // Skip redundant render
+  }
+  lastRenderHash = renderHash;
+  
   const activeVisualModules: VisualModuleState = {
     ...DEFAULT_VISUAL_MODULE_STATE,
     ...visualModules,
@@ -163,6 +193,8 @@ export const render = (options: RenderOptions) => {
   const viewWidth = viewWindow?.width ?? width;
   const viewHeight = viewWindow?.height ?? height;
 
+  // Optimize canvas operations
+  ctx.save();
   ctx.clearRect(0, 0, width, height);
 
   const resolvedRuntimeGeometry = runtimeGeometry ?? (() => {
@@ -818,4 +850,14 @@ export const render = (options: RenderOptions) => {
 
     ctx.restore();
   }
+
+  // Performance tracking
+  const renderTime = performance.now() - startTime;
+  performanceMetrics.renderCount++;
+  performanceMetrics.lastRenderTime = renderTime;
+  performanceMetrics.averageRenderTime = 
+    (performanceMetrics.averageRenderTime * (performanceMetrics.renderCount - 1) + renderTime) / performanceMetrics.renderCount;
+  
+  // Restore context state
+  ctx.restore();
 };

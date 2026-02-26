@@ -501,7 +501,7 @@ const App: React.FC = () => {
   const [mocapMode, setMocapMode] = useState(false);
   const [safeSwitch, setSafeSwitch] = useState(false);
   const [silhouetteMode, setSilhouetteMode] = useState(true);
-  const [lotteMode, setLotteMode] = useState(false);
+  const [visualFilterMode, setVisualFilterMode] = useState<'bitruvius' | 'lotte'>('bitruvius');
   const [masterPin, setMasterPin] = useState<[number, number]>([0, 0]);
   const [bodyRot, setBodyRot] = useState(0);
   const [isManualPoseChange, setIsManualPoseChange] = useState(false);
@@ -1058,8 +1058,11 @@ const App: React.FC = () => {
       return;
     }
 
-    const elapsedFrames = Math.max(0, ((time - clock.startTimeMs) / 1000) * fps);
+    // Throttle to target FPS for smoother animation
+    const targetFrameTime = 1000 / fps;
+    const elapsedFrames = Math.max(0, ((time - clock.startTimeMs) / targetFrameTime));
     const nextFrame = clock.startFrame + elapsedFrames;
+    
     if (nextFrame >= clock.rangeEnd) {
       currentFrameRef.current = clock.rangeStart;
       setCurrentFrame(clock.rangeStart);
@@ -1068,8 +1071,10 @@ const App: React.FC = () => {
       return;
     }
 
-    currentFrameRef.current = nextFrame;
-    setCurrentFrame(nextFrame);
+    // Smooth frame updates with rounding to prevent jitter
+    const roundedFrame = Math.round(nextFrame * 10) / 10;
+    currentFrameRef.current = roundedFrame;
+    setCurrentFrame(roundedFrame);
     animationFrameRef.current = requestAnimationFrame(animate);
   }, [fps]);
 
@@ -1291,7 +1296,7 @@ const App: React.FC = () => {
       setModuleStatusLine('Interaction Engine is off. Reset is disabled.');
       return;
     }
-    console.log('🔄 Pose reset triggered - this may cause snapback');
+    // Pose reset triggered - this may cause snapback
     clearRotationGestureCheckpoint();
     pushUndoSnapshot();
     
@@ -1347,7 +1352,7 @@ const App: React.FC = () => {
   const syncRotationsFromClip = useCallback(() => {
     // Don't overwrite manual pose changes
     if (isManualPoseChange) {
-      console.log('🚫 Sync blocked due to manual pose change');
+      // Don't overwrite manual pose changes
       return;
     }
     
@@ -1361,11 +1366,10 @@ const App: React.FC = () => {
       const clip = clipRef.current;
       try {
         const sampledPose = clip.sampleFrame(currentFrame);
-        console.log('🔄 Syncing pose from clip at frame', currentFrame);
         setRotations(sampledPose);
       } catch {
         // No keyframes - keep current
-        console.log('⚠️ No keyframes found at frame', currentFrame);
+        // No keyframes - keep current
       }
       syncTimeoutRef.current = null;
     }, 16); // Debounce to ~60fps
@@ -2047,9 +2051,9 @@ const App: React.FC = () => {
       s += `${id}:${deg};`;
     });
     const visualBits = `bg${visualModules.background ? 1 : 0}-hg${visualModules.headGrid ? 1 : 0}-fg${visualModules.fingerGrid ? 1 : 0}-rg${visualModules.rings ? 1 : 0}`;
-    s += `v:1;ss:${safeSwitch ? 1 : 0};tm:${mocapMode ? 1 : 0};sm:${silhouetteMode ? 1 : 0};lm:${lotteMode ? 1 : 0};b:0.15;hp:0;vm:${visualBits}`;
+    s += `v:1;ss:${safeSwitch ? 1 : 0};tm:${mocapMode ? 1 : 0};sm:${silhouetteMode ? 1 : 0};vm:${visualFilterMode};b:0.15;hp:0;vm:${visualBits}`;
     return s;
-  }, [rotations, masterPin, bodyRot, safeSwitch, mocapMode, silhouetteMode, lotteMode, visualModules.background, visualModules.fingerGrid, visualModules.headGrid, visualModules.rings]);
+  }, [rotations, masterPin, bodyRot, safeSwitch, mocapMode, silhouetteMode, visualFilterMode, visualModules.background, visualModules.fingerGrid, visualModules.headGrid, visualModules.rings]);
 
   const handleStringInput = (input: string) => {
     try {
@@ -2067,10 +2071,8 @@ const App: React.FC = () => {
           setSafeSwitch(v === '1');
         } else if (k === 'tm') {
           setMocapMode(v === '1');
-        } else if (k === 'sm') {
-          setSilhouetteMode(v === '1');
-        } else if (k === 'lm') {
-          setLotteMode(v === '1');
+        } else if (k === 'vm') {
+          setVisualFilterMode(v as 'bitruvius' | 'lotte');
         } else if (modelData.JOINT_DEFS[k]) {
           newRots[k] = Number(v);
         }
@@ -2244,10 +2246,18 @@ const App: React.FC = () => {
             SIL: {silhouetteMode ? 'ON' : 'OFF'}
           </button>
           <button
-            onClick={() => setLotteMode((prev) => !prev)}
-            className={`px-3 py-1 text-[9px] border rounded transition-colors ${lotteMode ? 'bg-amber-900/70 border-amber-500 text-amber-100' : 'bg-zinc-950 border-zinc-800 text-zinc-600'}`}
+            onClick={() => {
+              const modes: Array<'bitruvius' | 'lotte'> = ['bitruvius', 'lotte'];
+              const currentIndex = modes.indexOf(visualFilterMode);
+              const nextIndex = (currentIndex + 1) % modes.length;
+              setVisualFilterMode(modes[nextIndex]);
+            }}
+            className={`px-3 py-1 text-[9px] border rounded transition-colors ${
+              visualFilterMode === 'bitruvius' ? 'bg-blue-900/70 border-blue-500 text-blue-100' :
+              'bg-amber-900/70 border-amber-500 text-amber-100'
+            }`}
           >
-            LOTTE: {lotteMode ? 'ON' : 'OFF'}
+            {visualFilterMode.toUpperCase()}
           </button>
           <button
             onClick={mirrorPose}
@@ -2376,11 +2386,13 @@ const App: React.FC = () => {
           mocapMode={mocapMode}
           safeSwitch={safeSwitch}
           silhouetteMode={silhouetteMode}
-          lotteMode={lotteMode}
-          ikEnabled={coreModules.ik_engine}
-          interactionMode={coreModules.ik_engine ? interactionMode : "FK"}
-          onInteractionModeChange={handleToggleInteractionMode}
-          onToggleLotteMode={() => setLotteMode((prev) => !prev)}
+          lotteMode={visualFilterMode === 'lotte'}
+          onToggleVisualFilter={() => {
+            const modes: Array<'bitruvius' | 'lotte'> = ['bitruvius', 'lotte'];
+            const currentIndex = modes.indexOf(visualFilterMode);
+            const nextIndex = (currentIndex + 1) % modes.length;
+            setVisualFilterMode(modes[nextIndex]);
+          }}
           onReturnDefaultPose={coreModules.interaction_engine ? resetPose : undefined}
           onUndo={handleUndo}
           onRedo={handleRedo}

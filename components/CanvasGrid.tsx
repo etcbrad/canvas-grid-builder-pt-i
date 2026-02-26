@@ -102,7 +102,7 @@ interface CanvasGridProps {
   movementToggles?: MovementToggles;
   viewMode?: ViewModeId;
   onInteractionModeChange?: () => void;
-  onToggleLotteMode?: () => void;
+  onToggleVisualFilter?: () => void;
   onReturnDefaultPose?: () => void;
   onUndo?: () => void;
   onRedo?: () => void;
@@ -203,7 +203,7 @@ const DEFAULT_BODY_PART_MASK_LAYER: BodyPartMaskLayer = {
   visible: true,
   opacity: 1,
   scale: 100,
-  mode: 'projection',
+  mode: 'costume',
   rotationDeg: 0,
   skewXDeg: 0,
   skewYDeg: 0,
@@ -211,6 +211,7 @@ const DEFAULT_BODY_PART_MASK_LAYER: BodyPartMaskLayer = {
   offsetY: 0,
   blendMode: 'source-over',
   filter: 'none',
+  layerOrder: 'front',
 };
 
 const BODY_PART_MASK_SCALE_MIN = 1;
@@ -667,7 +668,7 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
   movementToggles = {},
   viewMode = 'default',
   onInteractionModeChange,
-  onToggleLotteMode,
+  onToggleVisualFilter,
   onReturnDefaultPose,
   onUndo,
   onRedo,
@@ -796,6 +797,8 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
   const [hoveredHeadGrid, setHoveredHeadGrid] = useState<HeadGridHoverInfo | null>(null);
   const [cursorPos, setCursorPos] = useState<{ x: number; y: number } | null>(null);
   const [ikTargets, setIkTargets] = useState<{ [chainId: string]: { x: number, y: number } }>({});
+  const [renderTrigger, setRenderTrigger] = useState(0);
+  const updateRafRef = useRef<number | null>(null);
   const ikInteractionActive = ikEnabled && interactionMode === "IK";
   const [dockPanel, setDockPanel] = useState<GridDockPanelId>('animate');
   const [exportBusy, setExportBusy] = useState<null | 'image' | 'video' | 'animation'>(null);
@@ -833,11 +836,201 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
   const [fkStretchOffsetByJoint, setFkStretchOffsetByJoint] = useState<Record<string, number>>({});
   const [jointTinkerLengths, setJointTinkerLengths] = useState<Record<string, number>>({});
   const [ikPosePrograms, setIkPosePrograms] = useState<IkPoseProgramMap>(DEFAULT_IK_POSE_PROGRAMS);
+  
+  // Automatic Pose Capture Engine for Artists
+  const [timelapseMode, setTimelapseMode] = useState(false);
+  const [capturedPoses, setCapturedPoses] = useState<Array<{
+    id: string;
+    timestamp: number;
+    rotations: SkeletonRotations;
+    rootX: number;
+    rootY: number;
+    rootRotate: number;
+  }>>([]);
+  
+  // Capture engine state
+  const lastCapturedPoseRef = useRef<SkeletonRotations | null>(null);
+  const lastCapturedRootRef = useRef<{ x: number; y: number; rotate: number } | null>(null);
+  const movementStartRef = useRef<number>(Date.now());
+  const captureTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const isPosingRef = useRef<boolean>(false);
+  const poseBufferRef = useRef<number>(2000); // 2 second buffer for multi-joint adjustments
+  const hasInitializedRef = useRef<boolean>(false); // Prevent multiple initial captures
+  
+  // Live preview states for blend modes
+  const [hoveredFgBlendMode, setHoveredFgBlendMode] = useState<GlobalCompositeOperation | null>(null);
+  const [hoveredMaskBlendMode, setHoveredMaskBlendMode] = useState<GlobalCompositeOperation | null>(null);
+
+  // Close dropdowns when clicking outside
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      const target = event.target as Element;
+      const fgDropdown = document.getElementById('fg-blend-dropdown');
+      const maskDropdown = document.getElementById('mask-blend-dropdown');
+      
+      if (fgDropdown && !target.closest('#fg-blend-dropdown') && !target.closest('button')) {
+        fgDropdown.style.display = 'none';
+      }
+      if (maskDropdown && !target.closest('#mask-blend-dropdown') && !target.closest('button')) {
+        maskDropdown.style.display = 'none';
+      }
+    };
+
+    document.addEventListener('click', handleClickOutside);
+    return () => document.removeEventListener('click', handleClickOutside);
+  }, []);
+
+  // Automatic Pose Capture Engine - Artist-focused logic
+  const detectSignificantChange = useCallback(() => {
+    if (!timelapseMode) return false;
+    
+    const currentRoot = {
+      x: movementToggles?.rootX ?? 0,
+      y: movementToggles?.rootY ?? 0,
+      rotate: movementToggles?.rootRotate ?? 0,
+    };
+    
+    // Check if this is a significantly different pose from last captured
+    const poseChanged = !lastCapturedPoseRef.current || 
+      Object.keys(currentRotations).some(jointId => 
+        Math.abs(currentRotations[jointId] - (lastCapturedPoseRef.current[jointId] || 0)) > 0.05
+      );
+    
+    const rootChanged = !lastCapturedRootRef.current ||
+      Math.abs(currentRoot.x - lastCapturedRootRef.current.x) > 5 ||
+      Math.abs(currentRoot.y - lastCapturedRootRef.current.y) > 5 ||
+      Math.abs(currentRoot.rotate - lastCapturedRootRef.current.rotate) > 0.1;
+    
+    return poseChanged || rootChanged;
+  }, [timelapseMode, currentRotations, movementToggles]);
+
+  const captureNewPose = useCallback(() => {
+    if (!timelapseMode) return;
+    
+    const currentRoot = {
+      x: movementToggles?.rootX ?? 0,
+      y: movementToggles?.rootY ?? 0,
+      rotate: movementToggles?.rootRotate ?? 0,
+    };
+    
+    const newPose = {
+      id: `pose_${capturedPoses.length + 1}`,
+      timestamp: Date.now(),
+      rotations: { ...currentRotations },
+      rootX: currentRoot.x,
+      rootY: currentRoot.y,
+      rootRotate: currentRoot.rotate,
+    };
+    
+    setCapturedPoses(prev => [...prev, newPose]);
+    lastCapturedPoseRef.current = { ...currentRotations };
+    lastCapturedRootRef.current = { ...currentRoot };
+    
+    console.log('Pose Capture: New pose captured automatically', newPose.id);
+  }, [timelapseMode, currentRotations, movementToggles, capturedPoses.length]);
+
+  const restorePose = useCallback((pose: typeof capturedPoses[0]) => {
+    onRotationsChange?.(pose.rotations);
+    onMovementTogglesChange?.({
+      rootX: pose.rootX,
+      rootY: pose.rootY,
+      rootRotate: pose.rootRotate,
+    });
+    lastCapturedPoseRef.current = { ...pose.rotations };
+    lastCapturedRootRef.current = { x: pose.rootX, y: pose.rootY, rotate: pose.rootRotate };
+  }, [onRotationsChange, onMovementTogglesChange]);
+
+  // Pose Capture Engine - Movement-activated timer system
+  useEffect(() => {
+    if (!timelapseMode) {
+      if (captureTimeoutRef.current) {
+        clearTimeout(captureTimeoutRef.current);
+        captureTimeoutRef.current = null;
+      }
+      isPosingRef.current = false;
+      return;
+    }
+
+    const checkPoseActivity = () => {
+      const hasSignificantChange = detectSignificantChange();
+      
+      if (hasSignificantChange) {
+        // Movement detected - restart timer
+        console.log('Pose Capture: Movement detected, restarting timer');
+        
+        // Clear any existing capture timeout
+        if (captureTimeoutRef.current) {
+          clearTimeout(captureTimeoutRef.current);
+        }
+        
+        // Start new capture timer after pose buffer
+        captureTimeoutRef.current = setTimeout(() => {
+          // Capture the pose after stillness period
+          captureNewPose();
+        }, poseBufferRef.current);
+      }
+      // If no movement, do nothing - let existing timer run or expire
+    };
+
+    const interval = setInterval(checkPoseActivity, 100);
+    return () => {
+      clearInterval(interval);
+      if (captureTimeoutRef.current) {
+        clearTimeout(captureTimeoutRef.current);
+      }
+    };
+  }, [timelapseMode, detectSignificantChange, captureNewPose]);
+
+  // Initialize pose capture engine
+  useEffect(() => {
+    if (!timelapseMode) {
+      if (captureTimeoutRef.current) {
+        clearTimeout(captureTimeoutRef.current);
+        captureTimeoutRef.current = null;
+      }
+      isPosingRef.current = false;
+      hasInitializedRef.current = false; // Reset flag when disabled
+      return;
+    }
+
+    // Only capture initial pose once when first activated
+    if (!hasInitializedRef.current) {
+      // Set initial captured pose as baseline
+      lastCapturedPoseRef.current = { ...currentRotations };
+      lastCapturedRootRef.current = {
+        x: movementToggles?.rootX ?? 0,
+        y: movementToggles?.rootY ?? 0,
+        rotate: movementToggles?.rootRotate ?? 0,
+      };
+      isPosingRef.current = false;
+      hasInitializedRef.current = true; // Mark as initialized
+      
+      // Clear any existing timeout
+      if (captureTimeoutRef.current) {
+        clearTimeout(captureTimeoutRef.current);
+        captureTimeoutRef.current = null;
+      }
+      
+      // Capture the first pose immediately upon activation
+      const initialPose = {
+        id: `pose_${capturedPoses.length + 1}`,
+        timestamp: Date.now(),
+        rotations: { ...currentRotations },
+        rootX: movementToggles?.rootX ?? 0,
+        rootY: movementToggles?.rootY ?? 0,
+        rootRotate: movementToggles?.rootRotate ?? 0,
+      };
+      
+      setCapturedPoses(prev => [...prev, initialPose]);
+      console.log('Pose Capture: Initial pose captured on activation', initialPose.id);
+    }
+  }, [timelapseMode]); // Remove other dependencies to prevent re-runs
 
   // Move computeWorld to top to resolve initialization order and prevent ReferenceError
   const computeWorld = useCallback((jointId: string, rotations: SkeletonRotations, canvasCenter: [number, number]): WorldCoords => {
-    // If joint tinker mode is active, use modified bone lengths
-    if (jointTinkerEnabled && Object.keys(jointTinkerLengths).length > 0) {
+    // Always use modified bone lengths if they exist (even when joint tinker is disabled)
+    // This allows pieces to stay in their modified positions after deactivating joint tinker
+    if (Object.keys(jointTinkerLengths).length > 0) {
       const path: string[] = [];
       let currentJointId: string | null = jointId;
       while (currentJointId) {
@@ -897,7 +1090,7 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
       y: rootY,
       rotate: rootRotate,
     });
-  }, [bitruviusData.JOINT_DEFS, rootX, rootY, rootRotate, jointTinkerEnabled, jointTinkerLengths]);
+  }, [bitruviusData.JOINT_DEFS, rootX, rootY, rootRotate, jointTinkerLengths]);
 
   useEffect(() => {
     if (interactionMode !== 'FK' && jointTinkerEnabled) {
@@ -907,11 +1100,17 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
 
   useEffect(() => {
     if (jointTinkerEnabled && !jointTinkerWasEnabledRef.current) {
+      // Store activation snapshot for potential revert
       jointTinkerActivationSnapshotRef.current = {
         rotations: { ...(rotationsRef.current ?? {}) },
         jointTinkerLengths: { ...(jointTinkerLengths ?? {}) },
       };
     } else if (!jointTinkerEnabled && jointTinkerWasEnabledRef.current) {
+      // When deactivating joint tinker, lock the current state
+      // Keep the modified joint lengths and rotations as-is
+      // Don't revert to activation state - lock where we deactivated
+      // Lock current joint lengths when deactivating joint tinker
+      // Clear the snapshot but keep the current jointTinkerLengths state
       jointTinkerActivationSnapshotRef.current = null;
     }
     jointTinkerWasEnabledRef.current = jointTinkerEnabled;
@@ -1187,6 +1386,18 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
     cursorPosRafRef.current = requestAnimationFrame(() => {
       cursorPosRafRef.current = null;
       setCursorPos(cursorPosRef.current);
+    });
+  }, []);
+
+  // Throttled update handler to reduce unnecessary renders
+  const throttledUpdateHandler = useCallback(() => {
+    if (updateRafRef.current !== null) {
+      return;
+    }
+    updateRafRef.current = requestAnimationFrame(() => {
+      updateRafRef.current = null;
+      // Trigger minimal re-render
+      setRenderTrigger(prev => prev + 1);
     });
   }, []);
 
@@ -1556,7 +1767,7 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
       
       // Log status for debugging
       const activeJoints = Object.keys(jointTinkerLengths).length;
-      console.log(`Joint Tinker Active: ${activeJoints} joints modified`);
+      // Emergency reset if too many joints are modified
       
       // Emergency reset if too many joints are modified (potential corruption)
       if (activeJoints > 40) {
@@ -1653,6 +1864,7 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
     };
     rotationsRef.current = nextRots;
     lastValidRotationsRef.current = nextRots;
+    // Movement is now detected automatically in the timelapse effect
     onRotationsChange?.(nextRots);
   }, [rootGroundLockEnabled, rootY, onRotationsChange, bitruviusData.JOINT_LIMITS]);
 
@@ -1661,6 +1873,7 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
     const nextRots = { ...rotationsRef.current, [jointId]: value };
     rotationsRef.current = nextRots;
     lastValidRotationsRef.current = nextRots;
+    // Movement is now detected automatically in the timelapse effect
     onRotationsChange?.(nextRots);
   }, [onRotationsChange]);
 
@@ -2334,19 +2547,41 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
       ikLastEventTsRef.current[chainId] = now;
 
       const target = fromDisplayPoint(mx, my);
+      
+      // Mirror cursor position for left-side IK chains to prevent 180-degree flicking
+      let mirroredTarget = target;
+      if (chainId.startsWith('l_')) {
+        // Mirror across the center of the screen
+        const centerX = sceneViewport.center[0];
+        const mirroredX = centerX - (target.x - centerX);
+        mirroredTarget = { x: mirroredX, y: target.y };
+      }
       const lowFrictionChain = LOW_FRICTION_IK_CHAINS.has(chainId);
-      const previousTarget = ikSmoothedTargetRef.current[chainId] ?? target;
-      const targetAlphaBase = lowFrictionChain ? IK_TARGET_SMOOTH_ALPHA_LOW_FRICTION : IK_TARGET_SMOOTH_ALPHA;
+      const isLeftSide = chainId.startsWith('l_');
+      const previousTarget = ikSmoothedTargetRef.current[chainId] ?? mirroredTarget;
+      
+      // Speed up left side reactions to match right side
+      let targetAlphaBase = lowFrictionChain ? IK_TARGET_SMOOTH_ALPHA_LOW_FRICTION : IK_TARGET_SMOOTH_ALPHA;
+      let targetDeadzone = lowFrictionChain ? IK_TARGET_DEADZONE_LOW_FRICTION : IK_TARGET_DEADZONE;
+      
+      if (isLeftSide) {
+        // Reduce smoothing and deadzone for faster left side response
+        targetAlphaBase = Math.min(0.9, targetAlphaBase * 1.5); // More aggressive blending
+        targetDeadzone = targetDeadzone * 0.5; // Smaller deadzone
+      }
+      
       const targetAlpha = resolveTemporalAlpha(targetAlphaBase, dtMs || IK_BASE_FRAME_MS);
-      const targetDeadzone = lowFrictionChain ? IK_TARGET_DEADZONE_LOW_FRICTION : IK_TARGET_DEADZONE;
-      const targetDistance = Math.hypot(target.x - previousTarget.x, target.y - previousTarget.y);
+      const targetDistance = Math.hypot(mirroredTarget.x - previousTarget.x, mirroredTarget.y - previousTarget.y);
       const deadzoneRatio = clamp(targetDistance / Math.max(targetDeadzone, 1e-6), 0, 1);
-      const distanceScaledAlpha = targetAlpha * (0.2 + deadzoneRatio * 0.8);
+      
+      // Even more aggressive distance scaling for left side
+      const distanceScaling = isLeftSide ? 0.1 : 0.2;
+      const distanceScaledAlpha = targetAlpha * (distanceScaling + deadzoneRatio * (1 - distanceScaling));
       const smoothedTarget = targetDistance <= IK_TARGET_HOLD_EPSILON
         ? previousTarget
         : {
-          x: blendValue(previousTarget.x, target.x, distanceScaledAlpha),
-          y: blendValue(previousTarget.y, target.y, distanceScaledAlpha),
+          x: blendValue(previousTarget.x, mirroredTarget.x, distanceScaledAlpha),
+          y: blendValue(previousTarget.y, mirroredTarget.y, distanceScaledAlpha),
         };
       ikSmoothedTargetRef.current[chainId] = smoothedTarget;
       const legIntent = resolveLegIntent({
@@ -2501,6 +2736,205 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
     return (window as Window & { __IK_DEBUG_OVERLAY__?: boolean }).__IK_DEBUG_OVERLAY__ === true;
   }, []);
 
+  const copyFigureSilhouette = useCallback(async () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    
+    // Create a temporary canvas for the silhouette
+    const tempCanvas = document.createElement('canvas');
+    const tempCtx = tempCanvas.getContext('2d');
+    if (!tempCtx) return;
+    
+    tempCanvas.width = canvas.width;
+    tempCanvas.height = canvas.height;
+    
+    // Make background transparent
+    tempCtx.clearRect(0, 0, tempCanvas.width, tempCanvas.height);
+    
+    // Render only the figure without background
+    const canvasCenter: [number, number] = [width / 2, height / 2];
+    
+    render({
+      ctx: tempCtx,
+      width: canvas.width,
+      height: canvas.height,
+      viewWindow: { x: 0, y: 0, width: canvas.width, height: canvas.height },
+      majorGridSize,
+      minorGridSize,
+      bitruviusData,
+      rotations: currentRotations,
+      mocapMode,
+      silhouetteMode,
+      ikTargets: {},
+      computeWorld,
+      ghostFrames: [],
+      visualModules: { headGrid: false, fingerGrid: false, rings: false, background: false },
+      backgroundLayer: { src: null, visible: false, opacity: 0, x: 0, y: 0, scale: 100 },
+      foregroundLayer: { src: null, visible: false, opacity: 0, x: 0, y: 0, scale: 100 },
+      bodyPartMasks: {},
+      lotteMode,
+      gridOnlyMode: true, // This removes grid
+      runtimeGeometry: createVitruvianRuntimeGeometry({
+        viewWindow: { x: 0, y: 0, width: canvas.width, height: canvas.height },
+        gridOnlyMode: true,
+        referenceHeelY: null
+      }),
+      showIkDebugOverlay: ikDebugOverlayEnabled,
+      headGridHover: null,
+      defaultPieceConfigs,
+      hideBoneShapesWithMasks: false,
+    });
+    
+    // Copy to clipboard
+    try {
+      tempCanvas.toBlob(async (blob) => {
+        if (blob) {
+          await navigator.clipboard.write([
+            new ClipboardItem({ 'image/png': blob })
+          ]);
+          // Figure silhouette copied to clipboard
+        }
+      });
+    } catch (err) {
+      console.error('Failed to copy figure silhouette:', err);
+      // Fallback: download the image
+      const link = document.createElement('a');
+      link.download = 'figure-silhouette.png';
+      link.href = tempCanvas.toDataURL();
+      link.click();
+    }
+  }, [canvasRef, width, height, majorGridSize, minorGridSize, bitruviusData, currentRotations, mocapMode, silhouetteMode, computeWorld, lotteMode, ikDebugOverlayEnabled, defaultPieceConfigs]);
+
+  const copyEntireCanvas = useCallback(async () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    
+    try {
+      canvas.toBlob(async (blob) => {
+        if (blob) {
+          await navigator.clipboard.write([
+            new ClipboardItem({ 'image/png': blob })
+          ]);
+          // Entire canvas copied to clipboard
+        }
+      });
+    } catch (err) {
+      console.error('Failed to copy entire canvas:', err);
+      // Fallback: download the image
+      const link = document.createElement('a');
+      link.download = 'entire-canvas.png';
+      link.href = canvas.toDataURL();
+      link.click();
+    }
+  }, [canvasRef]);
+
+  const copyCharacterAndGrid = useCallback(async () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    
+    // Create a temporary canvas for character and grid
+    const tempCanvas = document.createElement('canvas');
+    const tempCtx = tempCanvas.getContext('2d');
+    if (!tempCtx) return;
+    
+    tempCanvas.width = canvas.width;
+    tempCanvas.height = canvas.height;
+    
+    // Render character with grid but without UI elements
+    const canvasCenter: [number, number] = [width / 2, height / 2];
+    
+    render({
+      ctx: tempCtx,
+      width: canvas.width,
+      height: canvas.height,
+      viewWindow: { x: 0, y: 0, width: canvas.width, height: canvas.height },
+      majorGridSize,
+      minorGridSize,
+      bitruviusData,
+      rotations: currentRotations,
+      mocapMode,
+      silhouetteMode: false, // Show full character, not silhouette
+      ikTargets: {},
+      computeWorld,
+      ghostFrames: [],
+      visualModules: { headGrid: true, fingerGrid: true, rings: true, background: true }, // Include grid elements
+      backgroundLayer: resolvedBackgroundLayer,
+      foregroundLayer: resolvedForegroundLayer,
+      bodyPartMasks: {},
+      lotteMode,
+      gridOnlyMode: false, // Include character
+      runtimeGeometry: createVitruvianRuntimeGeometry({
+        viewWindow: { x: 0, y: 0, width: canvas.width, height: canvas.height },
+        gridOnlyMode: false,
+        referenceHeelY: null
+      }),
+      showIkDebugOverlay: false,
+      headGridHover: null,
+      defaultPieceConfigs,
+      hideBoneShapesWithMasks: false,
+    });
+    
+    // Copy to clipboard
+    try {
+      tempCanvas.toBlob(async (blob) => {
+        if (blob) {
+          await navigator.clipboard.write([
+            new ClipboardItem({ 'image/png': blob })
+          ]);
+          // Character and grid copied to clipboard
+        }
+      });
+    } catch (err) {
+      console.error('Failed to copy character and grid:', err);
+      // Fallback: download the image
+      const link = document.createElement('a');
+      link.download = 'character-and-grid.png';
+      link.href = tempCanvas.toDataURL();
+      link.click();
+    }
+  }, [canvasRef, width, height, majorGridSize, minorGridSize, bitruviusData, currentRotations, mocapMode, silhouetteMode, computeWorld, lotteMode, ikDebugOverlayEnabled, defaultPieceConfigs, resolvedBackgroundLayer, resolvedForegroundLayer]);
+
+  const handleContextMenu = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    
+    const rect = canvasRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    
+    // Check if click is on UI elements (console, buttons, etc.)
+    const target = e.target as Element;
+    const clickOnUI = target.closest('[data-ui-element="true"]') || 
+                     target.closest('button') || 
+                     target.closest('select') || 
+                     target.closest('input') ||
+                     target.classList.contains('absolute');
+    
+    if (clickOnUI) {
+      // Copy whole screen when clicking on console or buttons
+      copyEntireCanvas();
+      return;
+    }
+    
+    // Check if click is on the figure by checking if it's near any joint
+    const canvasCenter: [number, number] = [width / 2, height / 2];
+    const clickOnFigure = Object.keys(bitruviusData.JOINT_DEFS).some(jointId => {
+      const world = computeWorld(jointId, currentRotations, canvasCenter);
+      const pos = toDisplayPoint(world.x, world.y);
+      const distance = Math.sqrt(Math.pow(pos.x - mx, 2) + Math.pow(pos.y - my, 2));
+      return distance < 30; // 30px tolerance around joints
+    });
+    
+    if (clickOnFigure) {
+      // Copy clean figure only
+      copyFigureSilhouette();
+    } else {
+      // Copy character and grid when clicking on grid area
+      copyCharacterAndGrid();
+    }
+  }, [width, height, bitruviusData.JOINT_DEFS, currentRotations, computeWorld, toDisplayPoint, copyFigureSilhouette, copyCharacterAndGrid]);
+
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -2597,7 +3031,7 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
   const fgScaleDisplay = Math.round(resolvedFgScale);
   const bgFitMode = resolvedBackgroundLayer.fitMode ?? 'free';
   const fgFitMode = resolvedForegroundLayer.fitMode ?? 'free';
-  const fgBlendMode = resolvedForegroundLayer.blendMode ?? 'source-over';
+  const fgBlendMode = hoveredFgBlendMode ?? (resolvedForegroundLayer.blendMode ?? 'source-over');
   const loadedBodyMaskCount = maskableBodyPartIds.reduce((count, jointId) => {
     const layer = resolvedBodyPartMaskLayers[jointId];
     return layer?.src ? count + 1 : count;
@@ -2636,7 +3070,7 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
   const activeMaskOffsetY = Math.round(
     clamp(Number.isFinite(activeMaskEditorLayer.offsetY) ? activeMaskEditorLayer.offsetY : 0, -300, 300)
   );
-  const activeMaskBlendMode = activeMaskEditorLayer.blendMode ?? 'source-over';
+  const activeMaskBlendMode = hoveredMaskBlendMode ?? (activeMaskEditorLayer.blendMode ?? 'source-over');
   const activeMaskMode = activeMaskEditorLayer.mode ?? 'projection';
   const activeMaskFilter = (activeMaskEditorLayer.filter ?? 'none').trim() || 'none';
   const patchActiveMaskEditor = useCallback((patch: Partial<BodyPartMaskLayer>) => {
@@ -2695,6 +3129,10 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
         nx: number;
         ny: number;
         hasMask: boolean;
+        plusX: number;
+        plusY: number;
+        visibilityX: number;
+        visibilityY: number;
       }>;
     }
 
@@ -2804,6 +3242,12 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
       const clampedY = clamp(rawY, minY, maxY);
       const labelX = clampedX + vx * 14;
       const labelY = clampedY + vy * 14;
+      // Position + button one space below the label
+      const plusX = labelX;
+      const plusY = labelY + 20; // One space below label
+      // Position visibility toggle one space above the label
+      const visibilityX = labelX;
+      const visibilityY = labelY - 20; // One space above label
       return {
         jointId: handle.jointId,
         label: handle.label,
@@ -2817,6 +3261,10 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
         nx: vx,
         ny: vy,
         hasMask: handle.hasMask,
+        plusX,
+        plusY,
+        visibilityX,
+        visibilityY,
       };
     });
   }, [
@@ -3045,58 +3493,57 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
     ]
   );
 
-  const handle = useImperativeHandle(ref, () => ({
-    exportAsImage: async (options = {}) => {
-      const canvas = canvasRef.current;
-      if (!canvas) throw new Error('Canvas not available');
-      await exportCanvasAsImage(canvas, { format: 'png', ...options });
-    },
-    exportAsVideo: async (options = {}) => {
-      await handleExportTimelineVideoClick(options);
-    },
-    exportLogicBaked: async (options = {}) => {
-      const exportData = exportLogicBakedCharacter(
-        bitruviusData,
-        rotationsRef.current,
-        { x: rootX, y: rootY, rotate: rootRotate },
-        {
-          name: options.name,
-          description: options.description,
-          includeAnimations: options.includeAnimations ?? true,
-          keyframes: keyframePoseMap,
-          solver: ikSolver,
-          mode: interactionMode === 'IK' ? 'ik' : interactionMode === 'FK' ? 'fk' : 'hybrid',
-        }
-      );
-      downloadLogicBakedCharacter(exportData);
-    },
-    exportLogicBakedHTML: async (options = {}) => {
-      const exportData = exportLogicBakedCharacter(
-        bitruviusData,
-        rotationsRef.current,
-        { x: rootX, y: rootY, rotate: rootRotate },
-        {
-          name: options.name,
-          description: options.description,
-          includeAnimations: true,
-          keyframes: keyframePoseMap,
-          solver: ikSolver,
-          mode: interactionMode === 'IK' ? 'ik' : interactionMode === 'FK' ? 'fk' : 'hybrid',
-        }
-      );
-      downloadLogicBakedHTML(exportData, {
-        width: options.width ?? 800,
-        height: options.height ?? 600,
-        showControls: options.showControls ?? true,
-      });
-    },
-    getCanvas: () => canvasRef.current,
-  }), [handleExportTimelineVideoClick, bitruviusData, rotationsRef, rootX, rootY, rootRotate, keyframePoseMap, ikSolver, interactionMode]);
-
-  // Assign handle to ref for button access
+  useImperativeHandle(ref, () => imperativeHandleRef.current!, []);
+  
   useEffect(() => {
-    imperativeHandleRef.current = handle;
-  }, [handle]);
+    imperativeHandleRef.current = {
+      exportAsImage: async (options = {}) => {
+        const canvas = canvasRef.current;
+        if (!canvas) throw new Error('Canvas not available');
+        await exportCanvasAsImage(canvas, { format: 'png', ...options });
+      },
+      exportAsVideo: async (options = {}) => {
+        await handleExportTimelineVideoClick(options);
+      },
+      exportLogicBaked: async (options = {}) => {
+        const exportData = exportLogicBakedCharacter(
+          bitruviusData,
+          rotationsRef.current,
+          { x: rootX, y: rootY, rotate: rootRotate },
+          {
+            name: options.name,
+            description: options.description,
+            includeAnimations: options.includeAnimations ?? true,
+            keyframes: keyframePoseMap,
+            solver: ikSolver,
+            mode: interactionMode === 'IK' ? 'ik' : interactionMode === 'FK' ? 'fk' : 'hybrid',
+          }
+        );
+        downloadLogicBakedCharacter(exportData);
+      },
+      exportLogicBakedHTML: async (options = {}) => {
+        const exportData = exportLogicBakedCharacter(
+          bitruviusData,
+          rotationsRef.current,
+          { x: rootX, y: rootY, rotate: rootRotate },
+          {
+            name: options.name,
+            description: options.description,
+            includeAnimations: true,
+            keyframes: keyframePoseMap,
+            solver: ikSolver,
+            mode: interactionMode === 'IK' ? 'ik' : interactionMode === 'FK' ? 'fk' : 'hybrid',
+          }
+        );
+        downloadLogicBakedHTML(exportData, {
+          width: options.width ?? 800,
+          height: options.height ?? 600,
+          showControls: options.showControls ?? true,
+        });
+      },
+      getCanvas: () => canvasRef.current,
+    };
+  }, [handleExportTimelineVideoClick, bitruviusData, rootX, rootY, rootRotate, keyframePoseMap, ikSolver, interactionMode]);
 
   return (
     <div className="relative overflow-hidden" style={{ width: `${width}px`, height: `${height}px` }}>
@@ -3106,6 +3553,7 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
         onMouseLeave={handleMouseLeave}
+        onContextMenu={handleContextMenu}
         style={{ width: `${width}px`, height: `${height}px` }}
         className={gridOnlyMode ? "bg-transparent" : "bg-transparent shadow-2xl transition-colors duration-500"}
       />
@@ -3139,8 +3587,8 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
                 key={`mask-link-${handle.jointId}`}
                 x1={handle.jointX}
                 y1={handle.jointY}
-                x2={handle.x}
-                y2={handle.y}
+                x2={handle.labelX}
+                y2={handle.labelY}
                 stroke={handle.hasMask ? 'rgba(74, 222, 128, 0.5)' : 'rgba(158, 150, 184, 0.44)'}
                 strokeWidth={1.2}
                 strokeDasharray="3 3"
@@ -3149,22 +3597,28 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
           </svg>
           {bodyMaskUploadHandles.map((handle) => (
             <React.Fragment key={`mask-handle-${handle.jointId}`}>
+              {/* Visibility toggle above label */}
               <button
                 type="button"
-                onClick={() => openBodyPartMaskUpload(handle.jointId, true)}
-                className="absolute h-6 w-6 rounded-full border text-[13px] font-bold leading-none flex items-center justify-center transition-colors pointer-events-auto"
+                onClick={() => {
+                  const currentConfig = defaultPieceConfigs?.[handle.jointId];
+                  onPatchDefaultPieceConfig?.(handle.jointId, { visible: !(currentConfig?.visible ?? true) });
+                }}
+                className="absolute h-5 w-5 rounded-full border text-[10px] font-bold leading-none flex items-center justify-center transition-colors pointer-events-auto"
                 style={{
-                  left: `${handle.x}px`,
-                  top: `${handle.y}px`,
+                  left: `${handle.visibilityX}px`,
+                  top: `${handle.visibilityY}px`,
                   transform: 'translate(-50%, -50%)',
-                  background: handle.hasMask ? 'rgba(16, 88, 56, 0.82)' : 'rgba(18, 16, 24, 0.84)',
-                  borderColor: handle.hasMask ? 'rgba(74, 222, 128, 0.78)' : 'rgba(158, 150, 184, 0.72)',
+                  background: (defaultPieceConfigs?.[handle.jointId]?.visible ?? true) ? 'rgba(34, 197, 94, 0.82)' : 'rgba(239, 68, 68, 0.82)',
+                  borderColor: (defaultPieceConfigs?.[handle.jointId]?.visible ?? true) ? 'rgba(34, 197, 94, 0.78)' : 'rgba(239, 68, 68, 0.78)',
                   color: 'rgba(244, 244, 245, 0.95)',
                 }}
-                title={`Upload or replace mask for ${handle.label}`}
+                title={`Toggle default piece visibility for ${handle.label}`}
               >
-                +
+                {(defaultPieceConfigs?.[handle.jointId]?.visible ?? true) ? '👁' : '🚫'}
               </button>
+              
+              {/* Label in center */}
               <button
                 type="button"
                 onClick={() => setActiveMaskEditorJointId(handle.jointId)}
@@ -3180,6 +3634,24 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
                 title={`Edit mask settings for ${handle.label}`}
               >
                 {handle.shortLabel}
+              </button>
+              
+              {/* + button below label */}
+              <button
+                type="button"
+                onClick={() => openBodyPartMaskUpload(handle.jointId, true)}
+                className="absolute h-6 w-6 rounded-full border text-[13px] font-bold leading-none flex items-center justify-center transition-colors pointer-events-auto"
+                style={{
+                  left: `${handle.plusX}px`,
+                  top: `${handle.plusY}px`,
+                  transform: 'translate(-50%, -50%)',
+                  background: handle.hasMask ? 'rgba(16, 88, 56, 0.82)' : 'rgba(18, 16, 24, 0.84)',
+                  borderColor: handle.hasMask ? 'rgba(74, 222, 128, 0.78)' : 'rgba(158, 150, 184, 0.72)',
+                  color: 'rgba(244, 244, 245, 0.95)',
+                }}
+                title={`Upload or replace mask for ${handle.label}`}
+              >
+                +
               </button>
             </React.Fragment>
           ))}
@@ -3342,6 +3814,16 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
                     ? `Joint Tinker: ${jointTinkerEnabled ? 'On' : 'Off'}`
                     : `IK Advanced: ${showIkAdvancedControls ? 'On' : 'Off'}`}
                 </button>
+                {(interactionMode === 'FK' && (jointTinkerEnabled || Object.keys(jointTinkerLengths).length > 0)) && (
+                  <button
+                    type="button"
+                    onClick={resetJointTinkerToDefaultPose}
+                    className="min-h-7 px-2 py-1 text-[10px] border border-red-500/30 rounded text-red-300 hover:bg-red-500/20 transition-colors"
+                    title="Reset all joint modifications to default pose"
+                  >
+                    Reset
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={() => setTimelineControlsMinimized((prev) => !prev)}
@@ -3773,22 +4255,45 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
                         </div>
                         <label className="block space-y-1">
                           <span className="text-[9px] tracking-[0.05em] uppercase text-zinc-400">Blend</span>
-                          <select
-                            value={fgBlendMode}
+                          <div className="relative">
+                          <button
+                            type="button"
                             disabled={!onPatchForegroundImageLayer}
-                            onChange={(event) =>
-                              onPatchForegroundImageLayer?.({
-                                blendMode: event.target.value as GlobalCompositeOperation,
-                              })
-                            }
-                            className="w-full min-h-8 bg-zinc-950/75 border border-zinc-800 rounded px-2 py-1 text-[10px] text-zinc-200 disabled:opacity-45 disabled:cursor-not-allowed"
+                            onClick={() => {
+                              const dropdown = document.getElementById('fg-blend-dropdown');
+                              if (dropdown) {
+                                dropdown.style.display = dropdown.style.display === 'none' ? 'block' : 'none';
+                              }
+                            }}
+                            className="w-full min-h-8 bg-zinc-950/75 border border-zinc-800 rounded px-2 py-1 text-[10px] text-zinc-200 disabled:opacity-45 disabled:cursor-not-allowed text-left"
+                          >
+                            {FOREGROUND_BLEND_OPTIONS.find(opt => opt.value === fgBlendMode)?.label || 'Normal'}
+                          </button>
+                          <div 
+                            id="fg-blend-dropdown"
+                            className="absolute top-full left-0 right-0 mt-1 bg-zinc-950 border border-zinc-800 rounded shadow-lg z-50 hidden"
                           >
                             {FOREGROUND_BLEND_OPTIONS.map((option) => (
-                              <option key={option.value} value={option.value}>
+                              <button
+                                key={option.value}
+                                type="button"
+                                disabled={!onPatchForegroundImageLayer}
+                                onClick={() => {
+                                  onPatchForegroundImageLayer?.({
+                                    blendMode: option.value as GlobalCompositeOperation,
+                                  });
+                                  const dropdown = document.getElementById('fg-blend-dropdown');
+                                  if (dropdown) dropdown.style.display = 'none';
+                                }}
+                                onMouseEnter={() => setHoveredFgBlendMode(option.value as GlobalCompositeOperation)}
+                                onMouseLeave={() => setHoveredFgBlendMode(null)}
+                                className="w-full px-2 py-1 text-[10px] text-zinc-200 hover:bg-zinc-800 disabled:opacity-45 disabled:cursor-not-allowed text-left"
+                              >
                                 {option.label}
-                              </option>
+                              </button>
                             ))}
-                          </select>
+                          </div>
+                        </div>
                         </label>
                       </div>
 
@@ -3850,6 +4355,24 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
                                   disabled={!onPatchDefaultPieceConfig}
                                 >
                                   {visible ? 'Hide' : 'Show'}
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => onPatchDefaultPieceConfig?.(jointId, { bodyVisible: !(config?.bodyVisible ?? true) })}
+                                  className="min-h-7 px-1.5 py-1 text-[9px] border border-white/15 rounded text-zinc-200 hover:bg-white/10 transition-colors disabled:opacity-45 disabled:cursor-not-allowed"
+                                  disabled={!onPatchDefaultPieceConfig}
+                                  title="Toggle body visibility"
+                                >
+                                  B
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => onPatchDefaultPieceConfig?.(jointId, { shapeVisible: !(config?.shapeVisible ?? true) })}
+                                  className="min-h-7 px-1.5 py-1 text-[9px] border border-white/15 rounded text-zinc-200 hover:bg-white/10 transition-colors disabled:opacity-45 disabled:cursor-not-allowed"
+                                  disabled={!onPatchDefaultPieceConfig}
+                                  title="Toggle shape visibility"
+                                >
+                                  S
                                 </button>
                                 <button
                                   type="button"
@@ -4509,17 +5032,55 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
 
                 <label className="block space-y-1">
                   <span className="text-[9px] tracking-[0.05em] uppercase text-zinc-400">Blend</span>
-                  <select
-                    value={activeMaskBlendMode}
+                  <div className="relative">
+                  <button
+                    type="button"
                     disabled={!onPatchBodyPartMaskLayer}
-                    onChange={(event) => patchActiveMaskEditor({ blendMode: event.target.value as GlobalCompositeOperation })}
-                    className="w-full min-h-8 bg-zinc-950/75 border border-zinc-800 rounded px-2 py-1 text-[10px] text-zinc-200 disabled:opacity-45 disabled:cursor-not-allowed"
+                    onClick={() => {
+                      const dropdown = document.getElementById('mask-blend-dropdown');
+                      if (dropdown) {
+                        dropdown.style.display = dropdown.style.display === 'none' ? 'block' : 'none';
+                      }
+                    }}
+                    className="w-full min-h-8 bg-zinc-950/75 border border-zinc-800 rounded px-2 py-1 text-[10px] text-zinc-200 disabled:opacity-45 disabled:cursor-not-allowed text-left"
+                  >
+                    {FOREGROUND_BLEND_OPTIONS.find(opt => opt.value === activeMaskBlendMode)?.label || 'Normal'}
+                  </button>
+                  <div 
+                    id="mask-blend-dropdown"
+                    className="absolute top-full left-0 right-0 mt-1 bg-zinc-950 border border-zinc-800 rounded shadow-lg z-50 hidden"
                   >
                     {FOREGROUND_BLEND_OPTIONS.map((option) => (
-                      <option key={`editor-mask-blend-${option.value}`} value={option.value}>
+                      <button
+                        key={`editor-mask-blend-${option.value}`}
+                        type="button"
+                        disabled={!onPatchBodyPartMaskLayer}
+                        onClick={() => {
+                          patchActiveMaskEditor({ blendMode: option.value as GlobalCompositeOperation });
+                          const dropdown = document.getElementById('mask-blend-dropdown');
+                          if (dropdown) dropdown.style.display = 'none';
+                        }}
+                        onMouseEnter={() => setHoveredMaskBlendMode(option.value as GlobalCompositeOperation)}
+                        onMouseLeave={() => setHoveredMaskBlendMode(null)}
+                        className="w-full px-2 py-1 text-[10px] text-zinc-200 hover:bg-zinc-800 disabled:opacity-45 disabled:cursor-not-allowed text-left"
+                      >
                         {option.label}
-                      </option>
+                      </button>
                     ))}
+                  </div>
+                </div>
+                </label>
+
+                <label className="block space-y-1">
+                  <span className="text-[9px] tracking-[0.05em] uppercase text-zinc-400">Layer Order</span>
+                  <select
+                    value={activeMaskEditorLayer.layerOrder ?? 'front'}
+                    disabled={!onPatchBodyPartMaskLayer}
+                    onChange={(event) => patchActiveMaskEditor({ layerOrder: event.target.value as 'front' | 'behind' })}
+                    className="w-full min-h-8 bg-zinc-950/75 border border-zinc-800 rounded px-2 py-1 text-[10px] text-zinc-200 disabled:opacity-45 disabled:cursor-not-allowed"
+                  >
+                    <option value="front">Front (In Front)</option>
+                    <option value="behind">Behind (Behind Parent)</option>
                   </select>
                 </label>
 
@@ -4666,7 +5227,7 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
         </button>
       ) : null}
 
-      {gridOnlyMode && (onMovementTogglesChange || onInteractionModeChange || onToggleLotteMode || onUndo || onRedo || onReturnDefaultPose) ? (
+      {gridOnlyMode && (onMovementTogglesChange || onInteractionModeChange || onToggleVisualFilter || onUndo || onRedo || onReturnDefaultPose) ? (
         <>
           <div
             className="absolute flex items-center gap-2"
@@ -4710,6 +5271,22 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
                 title="Toggle joint tinker mode for click and drag joint manipulation"
               >
                 Joint Tinker {jointTinkerEnabled ? 'On' : 'Off'}
+              </button>
+            ) : null}
+
+            {interactionMode === "FK" && (jointTinkerEnabled || Object.keys(jointTinkerLengths).length > 0) ? (
+              <button
+                type="button"
+                onClick={resetJointTinkerToDefaultPose}
+                className="min-h-9 px-3 py-2 text-[11px] tracking-[0.1em] font-semibold uppercase rounded transition-colors"
+                style={{
+                  background: 'rgba(180, 56, 56, 0.34)',
+                  border: '1px solid rgba(239, 68, 68, 0.62)',
+                  color: 'rgba(254, 226, 226, 0.95)',
+                }}
+                title="Reset all joint modifications to default pose"
+              >
+                Reset
               </button>
             ) : null}
 
@@ -4799,19 +5376,19 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
               </button>
             ) : null}
 
-            {onToggleLotteMode ? (
+            {onToggleVisualFilter ? (
               <button
                 type="button"
-                onClick={onToggleLotteMode}
+                onClick={onToggleVisualFilter}
                 className="min-h-9 px-3 py-2 text-[11px] tracking-[0.1em] font-semibold uppercase rounded transition-colors"
                 style={{
-                  background: lotteMode ? 'rgba(112, 75, 35, 0.34)' : 'rgba(88, 82, 108, 0.28)',
-                  border: lotteMode ? '1px solid rgba(235, 198, 133, 0.66)' : '1px solid rgba(158, 150, 184, 0.62)',
-                  color: lotteMode ? 'rgba(255, 239, 210, 0.95)' : 'rgba(232, 228, 243, 0.95)',
+                  background: lotteMode ? 'rgba(112, 75, 35, 0.34)' : 'rgba(59, 130, 246, 0.34)',
+                  border: lotteMode ? '1px solid rgba(235, 198, 133, 0.66)' : '1px solid rgba(147, 197, 253, 0.66)',
+                  color: lotteMode ? 'rgba(255, 239, 210, 0.95)' : 'rgba(219, 234, 254, 0.95)',
                 }}
-                title="Toggle Lotte Reiniger-inspired silhouette mode"
+                title="Toggle visual filter mode (Bitruvius/Lotte)"
               >
-                Lotte {lotteMode ? 'On' : 'Off'}
+                {lotteMode ? 'LOTTE' : 'BITRUVIUS'}
               </button>
             ) : null}
 
@@ -4831,6 +5408,22 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
                 title="Open motion refinement controls"
               >
                 Refine {showRefineMenu ? 'On' : 'Off'}
+              </button>
+            ) : null}
+
+            {onMovementTogglesChange ? (
+              <button
+                type="button"
+                onClick={() => setTimelapseMode(prev => !prev)}
+                className="min-h-9 px-3 py-2 text-[11px] tracking-[0.1em] font-semibold uppercase rounded transition-colors"
+                style={{
+                  background: timelapseMode ? 'rgba(139, 92, 246, 0.34)' : 'rgba(88, 82, 108, 0.28)',
+                  border: timelapseMode ? '1px solid rgba(167, 139, 250, 0.62)' : '1px solid rgba(158, 150, 184, 0.62)',
+                  color: timelapseMode ? 'rgba(237, 233, 254, 0.95)' : 'rgba(232, 228, 243, 0.95)',
+                }}
+                title="Toggle timelapse mode to capture static poses for animation"
+              >
+                Timelapse {timelapseMode ? 'On' : 'Off'}
               </button>
             ) : null}
 
@@ -5046,9 +5639,8 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
                     <button
                       type="button"
                       onClick={() => {
-                        const handle = imperativeHandleRef.current;
-                        if (handle) {
-                          handle.exportLogicBaked({
+                        if (imperativeHandleRef.current) {
+                          imperativeHandleRef.current.exportLogicBaked({
                             name: 'Character',
                             description: 'Exported with physics constants',
                             includeAnimations: true,
@@ -5069,9 +5661,8 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
                     <button
                       type="button"
                       onClick={() => {
-                        const handle = imperativeHandleRef.current;
-                        if (handle) {
-                          handle.exportLogicBakedHTML({
+                        if (imperativeHandleRef.current) {
+                          imperativeHandleRef.current.exportLogicBakedHTML({
                             name: 'Character',
                             description: 'Standalone HTML with physics',
                             width: 800,
@@ -5202,6 +5793,7 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
 
           {showRefineMenu && onMovementTogglesChange ? (
             <div
+              data-ui-element="true"
               className="absolute border rounded shadow-xl backdrop-blur-sm"
               style={{
                 top: `${gridRefineTop + 34}px`,
@@ -5892,6 +6484,92 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
           ) : null}
         </>
       ) : null}
+
+          {timelapseMode && (
+            <div
+              data-ui-element="true"
+              className="absolute border rounded shadow-xl backdrop-blur-sm"
+              style={{
+                top: `${gridRefineTop + 34}px`,
+                right: `${UI_INSET}px`,
+                zIndex: 73,
+                width: '280px',
+                maxHeight: `${Math.max(200, height - (gridRefineTop + 96))}px`,
+                background: CONSOLE_PANEL_BACKGROUND,
+                borderColor: 'rgba(167, 139, 250, 0.5)',
+              }}
+            >
+              <div className="px-3 py-2 border-b border-violet-200/20">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[10px] tracking-[0.16em] uppercase text-violet-100/90 font-semibold">
+                    Captured Poses ({capturedPoses.length})
+                  </span>
+                  <div className="flex gap-1">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const jsonData = JSON.stringify(capturedPoses, null, 2);
+                        const blob = new Blob([jsonData], { type: 'application/json' });
+                        const url = URL.createObjectURL(blob);
+                        const a = document.createElement('a');
+                        a.href = url;
+                        a.download = `captured_poses_${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.json`;
+                        a.click();
+                        URL.revokeObjectURL(url);
+                      }}
+                      disabled={capturedPoses.length === 0}
+                      className="min-h-7 px-2 py-1 text-[10px] border border-white/15 rounded text-violet-100 hover:bg-white/10 transition-colors disabled:opacity-45 disabled:cursor-not-allowed"
+                      title="Export poses as JSON"
+                    >
+                      Export
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setCapturedPoses([])}
+                      disabled={capturedPoses.length === 0}
+                      className="min-h-7 px-2 py-1 text-[10px] border border-white/15 rounded text-violet-100 hover:bg-white/10 transition-colors disabled:opacity-45 disabled:cursor-not-allowed"
+                      title="Clear all captured poses"
+                    >
+                      Clear
+                    </button>
+                  </div>
+                </div>
+              </div>
+              <div className="px-2.5 py-2 max-h-60 overflow-y-auto custom-scrollbar">
+                {capturedPoses.length === 0 ? (
+                  <div className="text-[10px] text-zinc-400 text-center py-4">
+                    Move figure to automatically capture new poses
+                  </div>
+                ) : (
+                  <div className="space-y-1">
+                    {capturedPoses.map((pose, index) => (
+                      <div
+                        key={pose.id}
+                        className="flex items-center justify-between py-1.5 px-2 rounded border transition-colors bg-white/5 border-white/10 hover:bg-white/10"
+                      >
+                        <div className="flex-1">
+                          <div className="text-[10px] font-medium text-violet-100">
+                            {pose.id}
+                          </div>
+                          <div className="text-[9px] text-zinc-400">
+                            {new Date(pose.timestamp).toLocaleTimeString()}
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => restorePose(pose)}
+                          className="min-h-6 px-2 py-1 text-[9px] border border-violet-400/30 rounded text-violet-300 hover:bg-violet-400/20 transition-colors"
+                          title="Restore this pose"
+                        >
+                          Restore
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
 
       {!gridOnlyMode && (
       <div
