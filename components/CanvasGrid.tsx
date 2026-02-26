@@ -1401,6 +1401,73 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
     });
   }, []);
 
+  // Memoize joint controls to prevent performance issues when refine panel is open
+  const jointControls = React.useMemo(() => {
+    if (!showRefineMenu) return null;
+    
+    return bitruviusData.HIERARCHY.map(([jointId]) => {
+      const label = bitruviusData.JOINT_DEFS[jointId]?.label ?? jointId;
+      const min = -180;
+      const max = 180;
+      const value = normA(rotationsRef.current[jointId] ?? currentRotations[jointId] ?? 0);
+      const bendOffset = clamp(Math.round(fkBendOffsetByJoint[jointId] ?? 0), -12, 12);
+      const stretchOffset = clamp(Math.round(fkStretchOffsetByJoint[jointId] ?? 0), -12, 12);
+      return (
+        <label key={jointId} className="block px-1 py-1.5 border-b border-white/10 last:border-b-0">
+          <div className="text-[10px] tracking-[0.06em] uppercase text-zinc-300 mb-1 flex items-center justify-between">
+            <span>{label}</span>
+            <span className="flex items-center gap-1.5">
+              <label className="flex items-center gap-1">
+                <span className="text-[8px] text-emerald-300">B</span>
+                <input
+                  type="number"
+                  min={-12}
+                  max={12}
+                  step={1}
+                  value={bendOffset}
+                  onChange={(event) => {
+                    const next = clamp(Number(event.target.value), -12, 12);
+                    setFkBendOffsetByJoint((prev) => ({ ...prev, [jointId]: Math.round(next) }));
+                  }}
+                  className="w-10 h-5 px-1 text-[9px] bg-zinc-900 border border-white/10 rounded text-zinc-100"
+                  title="Bend offset (-12..12)"
+                />
+              </label>
+              <label className="flex items-center gap-1">
+                <span className="text-[8px] text-sky-300">S</span>
+                <input
+                  type="number"
+                  min={-12}
+                  max={12}
+                  step={1}
+                  value={stretchOffset}
+                  onChange={(event) => {
+                    const next = clamp(Number(event.target.value), -12, 12);
+                    setFkStretchOffsetByJoint((prev) => ({ ...prev, [jointId]: Math.round(next) }));
+                  }}
+                  className="w-10 h-5 px-1 text-[9px] bg-zinc-900 border border-white/10 rounded text-zinc-100"
+                  title="Stretch offset (-12..12)"
+                />
+              </label>
+              <span className="text-zinc-500">{Math.round(value)} deg</span>
+            </span>
+          </div>
+          <input
+            type="range"
+            min={min}
+            max={max}
+            step={1}
+            value={value}
+            onMouseDown={() => { fkSliderLastInputRef.current[jointId] = value; }}
+            onChange={(e) => setJointRotationFromWrappedSlider(jointId, Number(e.target.value))}
+            className="w-full accent-violet-400"
+            title={jointId}
+          />
+        </label>
+      );
+    });
+  }, [showRefineMenu, bitruviusData.HIERARCHY, bitruviusData.JOINT_DEFS, currentRotations, fkBendOffsetByJoint, fkStretchOffsetByJoint, setJointRotationFromWrappedSlider]);
+
   // Requirement: Guides back out to the border (0 margin for guides)
   const UI_INSET = 12;
   const TIMELINE_RAIL_WIDTH = 280;
@@ -2269,15 +2336,20 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
     }
   };
 
+  // Performance optimization: use ref for drag state during mouse operations
+  const dragStateRef = useRef(dragState);
+  dragStateRef.current = dragState;
+
   const handleMouseMove = (e: React.MouseEvent) => {
     const rect = canvasRef.current?.getBoundingClientRect();
     if (!rect) return;
     const mx = e.clientX - rect.left;
     const my = e.clientY - rect.top;
     scheduleCursorPosUpdate(mx, my);
-    const fkLivePoseDuringPlayback = isPlaying && (dragState?.type === 'FK' || dragState?.type === 'ROOT');
+    const currentDragState = dragStateRef.current;
+    const fkLivePoseDuringPlayback = isPlaying && (currentDragState?.type === 'FK' || currentDragState?.type === 'ROOT');
     if (isPlaying && !fkLivePoseDuringPlayback) {
-      if (dragState) {
+      if (currentDragState) {
         setDragState(null);
       }
       setHoveredJoint((prev) => (prev ? null : prev));
@@ -2285,14 +2357,16 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
       return;
     }
     const center = sceneViewport.center;
-    if (!dragState) {
+    if (!currentDragState) {
+      // Only update hover state when not dragging to improve performance
       updateHoveredJoint(mx, my, center);
       return;
     }
+    // Skip hover updates during drag for better performance
     setHoveredJoint((prev) => (prev ? null : prev));
     setHoveredHeadGrid((prev) => (prev ? null : prev));
 
-    if (dragState.type === "ROOT") {
+    if (currentDragState.type === "ROOT") {
       const nextRootX = mx - center[0];
       const nextRootY = my - center[1];
       onMasterPinChange?.([nextRootX, nextRootY]);
@@ -2303,8 +2377,8 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
         applyGroundWeightFromRootY(nextRootY);
       }
       onMovementTogglesChange?.(patch);
-    } else if (dragState.type === "FK") {
-      const id = dragState.id;
+    } else if (currentDragState.type === "FK") {
+      const id = currentDragState.id;
       if (id === 'root' && !rootRotateControlEnabled) {
         return;
       }
@@ -2532,8 +2606,8 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
       rotationsRef.current = nextRots;
       lastValidRotationsRef.current = nextRots;
       onRotationsChange?.(nextRots);
-    } else if (dragState.type === "IK") {
-      const chainId = dragState.id;
+    } else if (currentDragState.type === "IK") {
+      const chainId = currentDragState.id;
       if (
         !ikInteractionActive ||
         !activeIKChains[chainId] ||
@@ -2702,13 +2776,14 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
   };
 
   const handleMouseUp = () => {
-    if (dragState?.type === "IK") {
-      delete ikSmoothedTargetRef.current[dragState.id];
-      delete ikLastEventTsRef.current[dragState.id];
+    const currentDragState = dragStateRef.current;
+    if (currentDragState?.type === "IK") {
+      delete ikSmoothedTargetRef.current[currentDragState.id];
+      delete ikLastEventTsRef.current[currentDragState.id];
       ikGroundPinsRef.current = {};
-    } else if (dragState?.type === "FK") {
-      delete fkTargetRotationRef.current[dragState.id];
-      delete fkLastEventTsRef.current[dragState.id];
+    } else if (currentDragState?.type === "FK") {
+      delete fkTargetRotationRef.current[currentDragState.id];
+      delete fkLastEventTsRef.current[currentDragState.id];
     }
     setDragState(null);
     setHoveredJoint((prev) => (prev ? null : prev));
@@ -2716,13 +2791,14 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
   };
 
   const handleMouseLeave = () => {
-    if (dragState?.type === "IK") {
-      delete ikSmoothedTargetRef.current[dragState.id];
-      delete ikLastEventTsRef.current[dragState.id];
+    const currentDragState = dragStateRef.current;
+    if (currentDragState?.type === "IK") {
+      delete ikSmoothedTargetRef.current[currentDragState.id];
+      delete ikLastEventTsRef.current[currentDragState.id];
       ikGroundPinsRef.current = {};
-    } else if (dragState?.type === "FK") {
-      delete fkTargetRotationRef.current[dragState.id];
-      delete fkLastEventTsRef.current[dragState.id];
+    } else if (currentDragState?.type === "FK") {
+      delete fkTargetRotationRef.current[currentDragState.id];
+      delete fkLastEventTsRef.current[currentDragState.id];
     }
     setDragState(null);
     setHoveredJoint((prev) => (prev ? null : prev));
@@ -5987,67 +6063,7 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
                   </div>
                   {(refinePanelMode === 'advanced' || true) ? (
                     <div className="max-h-72 overflow-y-auto custom-scrollbar pr-1 space-y-1">
-                      {bitruviusData.HIERARCHY.map(([jointId]) => {
-                        const label = bitruviusData.JOINT_DEFS[jointId]?.label ?? jointId;
-                        const min = -180;
-                        const max = 180;
-                        const value = normA(rotationsRef.current[jointId] ?? currentRotations[jointId] ?? 0);
-                        const bendOffset = clamp(Math.round(fkBendOffsetByJoint[jointId] ?? 0), -12, 12);
-                        const stretchOffset = clamp(Math.round(fkStretchOffsetByJoint[jointId] ?? 0), -12, 12);
-                        return (
-                          <label key={jointId} className="block px-1 py-1.5 border-b border-white/10 last:border-b-0">
-                            <div className="text-[10px] tracking-[0.06em] uppercase text-zinc-300 mb-1 flex items-center justify-between">
-                              <span>{label}</span>
-                              <span className="flex items-center gap-1.5">
-                                <label className="flex items-center gap-1">
-                                  <span className="text-[8px] text-emerald-300">B</span>
-                                  <input
-                                    type="number"
-                                    min={-12}
-                                    max={12}
-                                    step={1}
-                                    value={bendOffset}
-                                    onChange={(event) => {
-                                      const next = clamp(Number(event.target.value), -12, 12);
-                                      setFkBendOffsetByJoint((prev) => ({ ...prev, [jointId]: Math.round(next) }));
-                                    }}
-                                    className="w-10 h-5 px-1 text-[9px] bg-zinc-900 border border-white/10 rounded text-zinc-100"
-                                    title="Bend offset (-12..12)"
-                                  />
-                                </label>
-                                <label className="flex items-center gap-1">
-                                  <span className="text-[8px] text-sky-300">S</span>
-                                  <input
-                                    type="number"
-                                    min={-12}
-                                    max={12}
-                                    step={1}
-                                    value={stretchOffset}
-                                    onChange={(event) => {
-                                      const next = clamp(Number(event.target.value), -12, 12);
-                                      setFkStretchOffsetByJoint((prev) => ({ ...prev, [jointId]: Math.round(next) }));
-                                    }}
-                                    className="w-10 h-5 px-1 text-[9px] bg-zinc-900 border border-white/10 rounded text-zinc-100"
-                                    title="Stretch offset (-12..12)"
-                                  />
-                                </label>
-                                <span className="text-zinc-500">{Math.round(value)} deg</span>
-                              </span>
-                            </div>
-                            <input
-                              type="range"
-                              min={min}
-                              max={max}
-                              step={1}
-                              value={value}
-                              onMouseDown={() => { fkSliderLastInputRef.current[jointId] = value; }}
-                              onChange={(e) => setJointRotationFromWrappedSlider(jointId, Number(e.target.value))}
-                              className="w-full accent-violet-400"
-                              title={jointId}
-                            />
-                          </label>
-                        );
-                      })}
+                      {jointControls}
                     </div>
                   ) : (
                     <div className="px-1 py-1.5 text-[10px] text-zinc-400 tracking-[0.04em]">
