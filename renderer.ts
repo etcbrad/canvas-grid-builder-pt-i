@@ -491,18 +491,19 @@ export const render = (options: RenderOptions) => {
         if (!shape || shape.type === "none") return;
         const pos = posMap[id];
         const pieceConfig = defaultPieceConfigs?.[id];
-        const pieceVisible = pieceConfig?.visible ?? true;
-        if (!pieceVisible) {
-          return;
-        }
+        const pieceVisible = pieceConfig?.visible !== false;
         
-        // Check if we should hide this bone shape when masks are active (for ghost frames)
+        // Check if we should hide this bone shape when masks are active
         const hasActiveMask = bodyPartMasks?.[id]?.visible && bodyPartMasks?.[id]?.src;
-        if (hideBoneShapesWithMasks && hasActiveMask && !isShadow) {
-          // Skip drawing bone shape for ghost frames when masks are active
+        if ((hideBoneShapesWithMasks || !pieceVisible) && hasActiveMask && !isShadow) {
           return;
         }
         
+        // If not visible and no mask, definitely skip
+        if (!pieceVisible && !hasActiveMask && !isShadow) {
+          return;
+        }
+
         const t = computeWorld(id, rots, center);
         ctx.save();
         if (isShadow && drawShadows) {
@@ -512,12 +513,6 @@ export const render = (options: RenderOptions) => {
           ctx.rotate(d2r(t.angle));
           ctx.scale(modelScale, modelScale);
         } else {
-          const pieceConfig = defaultPieceConfigs?.[id];
-          const pieceVisible = pieceConfig?.visible ?? true;
-          if (!pieceVisible) {
-            ctx.restore();
-            return;
-          }
           const pieceRotationRad = d2r(pieceConfig?.rotationDeg ?? 0);
           const pieceScale = Math.max(0.05, Math.min(4, pieceConfig?.scale ?? 1));
           const combinedScale = modelScale * pieceScale;

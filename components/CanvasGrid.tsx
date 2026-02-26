@@ -893,13 +893,13 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
     // Check if this is a significantly different pose from last captured
     const poseChanged = !lastCapturedPoseRef.current || 
       Object.keys(currentRotations).some(jointId => 
-        Math.abs(currentRotations[jointId] - (lastCapturedPoseRef.current[jointId] || 0)) > 0.05
+        Math.abs(normA(currentRotations[jointId] - (lastCapturedPoseRef.current[jointId] || 0))) > 2.0
       );
     
     const rootChanged = !lastCapturedRootRef.current ||
       Math.abs(currentRoot.x - lastCapturedRootRef.current.x) > 5 ||
       Math.abs(currentRoot.y - lastCapturedRootRef.current.y) > 5 ||
-      Math.abs(currentRoot.rotate - lastCapturedRootRef.current.rotate) > 0.1;
+      Math.abs(currentRoot.rotate - lastCapturedRootRef.current.rotate) > 1.0;
     
     return poseChanged || rootChanged;
   }, [timelapseMode, currentRotations, movementToggles]);
@@ -912,7 +912,8 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
       y: movementToggles?.rootY ?? 0,
       rotate: movementToggles?.rootRotate ?? 0,
     };
-    
+
+    // Ensure we actually capture a new snapshot of state
     const newPose = {
       id: `pose_${capturedPoses.length + 1}`,
       timestamp: Date.now(),
@@ -929,25 +930,13 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
     console.log('Pose Capture: New pose captured automatically', newPose.id);
   }, [timelapseMode, currentRotations, movementToggles, capturedPoses.length]);
 
-  const restorePose = useCallback((pose: typeof capturedPoses[0]) => {
-    onRotationsChange?.(pose.rotations);
-    onMovementTogglesChange?.({
-      rootX: pose.rootX,
-      rootY: pose.rootY,
-      rootRotate: pose.rootRotate,
-    });
-    lastCapturedPoseRef.current = { ...pose.rotations };
-    lastCapturedRootRef.current = { x: pose.rootX, y: pose.rootY, rotate: pose.rootRotate };
-  }, [onRotationsChange, onMovementTogglesChange]);
-
-  // Pose Capture Engine - Movement-activated timer system
+  // Pose Capture Engine - Stillness-activated system
   useEffect(() => {
     if (!timelapseMode) {
       if (captureTimeoutRef.current) {
         clearTimeout(captureTimeoutRef.current);
         captureTimeoutRef.current = null;
       }
-      isPosingRef.current = false;
       return;
     }
 
@@ -955,24 +944,19 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
       const hasSignificantChange = detectSignificantChange();
       
       if (hasSignificantChange) {
-        // Movement detected - restart timer
-        console.log('Pose Capture: Movement detected, restarting timer');
-        
-        // Clear any existing capture timeout
+        // Clear any existing capture timeout and restart timer for stillness
         if (captureTimeoutRef.current) {
           clearTimeout(captureTimeoutRef.current);
         }
         
-        // Start new capture timer after pose buffer
         captureTimeoutRef.current = setTimeout(() => {
-          // Capture the pose after stillness period
           captureNewPose();
-        }, poseBufferRef.current);
+          captureTimeoutRef.current = null;
+        }, 1000); // Wait for 1 second of stillness
       }
-      // If no movement, do nothing - let existing timer run or expire
     };
 
-    const interval = setInterval(checkPoseActivity, 100);
+    const interval = setInterval(checkPoseActivity, 200);
     return () => {
       clearInterval(interval);
       if (captureTimeoutRef.current) {
@@ -5189,10 +5173,10 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
                 </label>
               </div>
 
-	              <div className="grid grid-cols-2 gap-1.5 border border-white/10 rounded p-2">
-	                <label className="space-y-1">
-	                  <span className="text-[9px] tracking-[0.05em] uppercase text-zinc-400">Opacity</span>
-	                  <input
+                      <div className="grid grid-cols-2 gap-1.5 border border-white/10 rounded p-2">
+                        <label className="space-y-1">
+                          <span className="text-[9px] tracking-[0.05em] uppercase text-zinc-400">Opacity</span>
+                          <input
                     type="number"
                     min={0}
                     max={100}
@@ -5202,20 +5186,20 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
                     className="w-full min-h-8 bg-zinc-950/75 border border-zinc-800 rounded px-2 py-1 text-[10px] text-zinc-300 disabled:opacity-45 disabled:cursor-not-allowed"
                   />
                 </label>
-	                <label className="space-y-1">
-	                  <span className="text-[9px] tracking-[0.05em] uppercase text-zinc-400">Scale</span>
-	                  <input
-	                    type="number"
-	                    min={BODY_PART_MASK_SCALE_MIN}
-	                    max={400}
-	                    value={activeMaskScalePercent}
-	                    disabled={!onPatchBodyPartMaskLayer}
-	                    onChange={(event) => patchActiveMaskEditor({
-	                      scale: clamp(Number(event.target.value), BODY_PART_MASK_SCALE_MIN, 400),
-	                    })}
-	                    className="w-full min-h-8 bg-zinc-950/75 border border-zinc-800 rounded px-2 py-1 text-[10px] text-zinc-300 disabled:opacity-45 disabled:cursor-not-allowed"
-	                  />
-	                </label>
+                        <label className="space-y-1">
+                          <span className="text-[9px] tracking-[0.05em] uppercase text-zinc-400">Scale</span>
+                          <input
+                            type="number"
+                            min={BODY_PART_MASK_SCALE_MIN}
+                            max={400}
+                            value={activeMaskScalePercent}
+                            disabled={!onPatchBodyPartMaskLayer}
+                            onChange={(event) => patchActiveMaskEditor({
+                              scale: clamp(Number(event.target.value), BODY_PART_MASK_SCALE_MIN, 400),
+                            })}
+                            className="w-full min-h-8 bg-zinc-950/75 border border-zinc-800 rounded px-2 py-1 text-[10px] text-zinc-300 disabled:opacity-45 disabled:cursor-not-allowed"
+                          />
+                        </label>
                 <label className="space-y-1">
                   <span className="text-[9px] tracking-[0.05em] uppercase text-zinc-400">Rotate</span>
                   <input
@@ -5224,65 +5208,65 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
                     max={360}
                     value={activeMaskRotation}
                     disabled={!onPatchBodyPartMaskLayer}
-	                    onChange={(event) => patchActiveMaskEditor({ rotationDeg: clamp(Number(event.target.value), -360, 360) })}
-	                    className="w-full min-h-8 bg-zinc-950/75 border border-zinc-800 rounded px-2 py-1 text-[10px] text-zinc-300 disabled:opacity-45 disabled:cursor-not-allowed"
-	                  />
-	                </label>
-	                <div className="col-span-2 grid grid-cols-2 gap-1.5">
-	                  <div className="space-y-1.5">
-	                    <label className="space-y-1">
-	                      <span className="text-[9px] tracking-[0.05em] uppercase text-zinc-400">Skew X</span>
-	                      <input
-	                        type="number"
-	                        min={-80}
-	                        max={80}
-	                        value={activeMaskSkewX}
-	                        disabled={!onPatchBodyPartMaskLayer}
-	                        onChange={(event) => patchActiveMaskEditor({ skewXDeg: clamp(Number(event.target.value), -80, 80) })}
-	                        className="w-full min-h-8 bg-zinc-950/75 border border-zinc-800 rounded px-2 py-1 text-[10px] text-zinc-300 disabled:opacity-45 disabled:cursor-not-allowed"
-	                      />
-	                    </label>
-	                    <label className="space-y-1">
-	                      <span className="text-[9px] tracking-[0.05em] uppercase text-zinc-400">Offset X</span>
-	                      <input
-	                        type="number"
-	                        min={-300}
-	                        max={300}
-	                        value={activeMaskOffsetX}
-	                        disabled={!onPatchBodyPartMaskLayer}
-	                        onChange={(event) => patchActiveMaskEditor({ offsetX: clamp(Number(event.target.value), -300, 300) })}
-	                        className="w-full min-h-8 bg-zinc-950/75 border border-zinc-800 rounded px-2 py-1 text-[10px] text-zinc-300 disabled:opacity-45 disabled:cursor-not-allowed"
-	                      />
-	                    </label>
-	                  </div>
-	                  <div className="space-y-1.5">
-	                    <label className="space-y-1">
-	                      <span className="text-[9px] tracking-[0.05em] uppercase text-zinc-400">Skew Y</span>
-	                      <input
-	                        type="number"
-	                        min={-80}
-	                        max={80}
-	                        value={activeMaskSkewY}
-	                        disabled={!onPatchBodyPartMaskLayer}
-	                        onChange={(event) => patchActiveMaskEditor({ skewYDeg: clamp(Number(event.target.value), -80, 80) })}
-	                        className="w-full min-h-8 bg-zinc-950/75 border border-zinc-800 rounded px-2 py-1 text-[10px] text-zinc-300 disabled:opacity-45 disabled:cursor-not-allowed"
-	                      />
-	                    </label>
-	                    <label className="space-y-1">
-	                      <span className="text-[9px] tracking-[0.05em] uppercase text-zinc-400">Offset Y</span>
-	                      <input
-	                        type="number"
-	                        min={-300}
-	                        max={300}
-	                        value={activeMaskOffsetY}
-	                        disabled={!onPatchBodyPartMaskLayer}
-	                        onChange={(event) => patchActiveMaskEditor({ offsetY: clamp(Number(event.target.value), -300, 300) })}
-	                        className="w-full min-h-8 bg-zinc-950/75 border border-zinc-800 rounded px-2 py-1 text-[10px] text-zinc-300 disabled:opacity-45 disabled:cursor-not-allowed"
-	                      />
-	                    </label>
-	                  </div>
-	                </div>
-	              </div>
+                            onChange={(event) => patchActiveMaskEditor({ rotationDeg: clamp(Number(event.target.value), -360, 360) })}
+                            className="w-full min-h-8 bg-zinc-950/75 border border-zinc-800 rounded px-2 py-1 text-[10px] text-zinc-300 disabled:opacity-45 disabled:cursor-not-allowed"
+                          />
+                        </label>
+                        <div className="col-span-2 grid grid-cols-2 gap-1.5">
+                          <div className="space-y-1.5">
+                            <label className="space-y-1">
+                              <span className="text-[9px] tracking-[0.05em] uppercase text-zinc-400">Skew X</span>
+                              <input
+                                type="number"
+                                min={-80}
+                                max={80}
+                                value={activeMaskSkewX}
+                                disabled={!onPatchBodyPartMaskLayer}
+                                onChange={(event) => patchActiveMaskEditor({ skewXDeg: clamp(Number(event.target.value), -80, 80) })}
+                                className="w-full min-h-8 bg-zinc-950/75 border border-zinc-800 rounded px-2 py-1 text-[10px] text-zinc-300 disabled:opacity-45 disabled:cursor-not-allowed"
+                              />
+                            </label>
+                            <label className="space-y-1">
+                              <span className="text-[9px] tracking-[0.05em] uppercase text-zinc-400">Offset X</span>
+                              <input
+                                type="number"
+                                min={-300}
+                                max={300}
+                                value={activeMaskOffsetX}
+                                disabled={!onPatchBodyPartMaskLayer}
+                                onChange={(event) => patchActiveMaskEditor({ offsetX: clamp(Number(event.target.value), -300, 300) })}
+                                className="w-full min-h-8 bg-zinc-950/75 border border-zinc-800 rounded px-2 py-1 text-[10px] text-zinc-300 disabled:opacity-45 disabled:cursor-not-allowed"
+                              />
+                            </label>
+                          </div>
+                          <div className="space-y-1.5">
+                            <label className="space-y-1">
+                              <span className="text-[9px] tracking-[0.05em] uppercase text-zinc-400">Skew Y</span>
+                              <input
+                                type="number"
+                                min={-80}
+                                max={80}
+                                value={activeMaskSkewY}
+                                disabled={!onPatchBodyPartMaskLayer}
+                                onChange={(event) => patchActiveMaskEditor({ skewYDeg: clamp(Number(event.target.value), -80, 80) })}
+                                className="w-full min-h-8 bg-zinc-950/75 border border-zinc-800 rounded px-2 py-1 text-[10px] text-zinc-300 disabled:opacity-45 disabled:cursor-not-allowed"
+                              />
+                            </label>
+                            <label className="space-y-1">
+                              <span className="text-[9px] tracking-[0.05em] uppercase text-zinc-400">Offset Y</span>
+                              <input
+                                type="number"
+                                min={-300}
+                                max={300}
+                                value={activeMaskOffsetY}
+                                disabled={!onPatchBodyPartMaskLayer}
+                                onChange={(event) => patchActiveMaskEditor({ offsetY: clamp(Number(event.target.value), -300, 300) })}
+                                className="w-full min-h-8 bg-zinc-950/75 border border-zinc-800 rounded px-2 py-1 text-[10px] text-zinc-300 disabled:opacity-45 disabled:cursor-not-allowed"
+                              />
+                            </label>
+                          </div>
+                        </div>
+                      </div>
             </div>
           </div>
         </div>
@@ -5306,11 +5290,15 @@ const CanvasGrid = forwardRef<CanvasGridRef, CanvasGridProps>(({
       {gridOnlyMode && (onMovementTogglesChange || onInteractionModeChange || onToggleVisualFilter || onUndo || onRedo || onReturnDefaultPose) ? (
         <>
           <div
-            className="absolute flex items-center gap-2"
+            className="absolute flex flex-wrap items-center gap-2 p-2 rounded-lg pointer-events-auto"
             style={{
               top: `${gridRefineTop}px`,
               left: `${UI_INSET}px`,
+              right: `${UI_INSET}px`,
               zIndex: 72,
+              background: CONSOLE_PANEL_BACKGROUND,
+              backdropFilter: 'blur(8px)',
+              border: '1px solid rgba(158, 150, 184, 0.2)',
             }}
           >
             {onInteractionModeChange ? (
